@@ -1,5 +1,5 @@
 /**	@file midl.h
- *	@brief LMDB ID List header file.
+ *	@brief DLMDB ID List header file.
  *
  *	This file was originally part of back-bdb but has been
  *	modified for use in libmdb. Most of the macros defined
@@ -27,13 +27,13 @@
 #ifndef _MDB_MIDL_H_
 #define _MDB_MIDL_H_
 
-#include "lmdb.h"
+#include "dlmdb.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** @defgroup internal	LMDB Internals
+/** @defgroup internal	DLMDB Internals
  *	@{
  */
 

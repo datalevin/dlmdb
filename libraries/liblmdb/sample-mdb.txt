@@ -15,7 +15,7 @@
  * <http://www.OpenLDAP.org/license.html>.
  */
 #include <stdio.h>
-#include "lmdb.h"
+#include "dlmdb.h"
 
 int main(int argc,char * argv[])
 {

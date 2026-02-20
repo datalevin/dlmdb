@@ -81,11 +81,11 @@ libdlmdb$(SOEXT):	mdb.lo midl.lo
 #	$(CC) $(LDFLAGS) -pthread -shared -Wl,-Bsymbolic -o $@ mdb.o midl.o $(SOLIBS)
 	$(CC) $(LDFLAGS) -pthread -shared -o $@ mdb.lo midl.lo $(SOLIBS)
 
-dlmdb_stat: dlmdb_stat.o $(LINKLIBS)
-dlmdb_copy: dlmdb_copy.o $(LINKLIBS)
-dlmdb_dump: dlmdb_dump.o $(LINKLIBS)
-dlmdb_load: dlmdb_load.o $(LINKLIBS)
-dlmdb_drop: dlmdb_drop.o $(LINKLIBS)
+dlmdb_stat: mdb_stat.o $(LINKLIBS)
+dlmdb_copy: mdb_copy.o $(LINKLIBS)
+dlmdb_dump: mdb_dump.o $(LINKLIBS)
+dlmdb_load: mdb_load.o $(LINKLIBS)
+dlmdb_drop: mdb_drop.o $(LINKLIBS)
 mtest:  mtest.o $(LINKLIBS)
 mtest2:	mtest2.o $(LINKLIBS)
 mtest3:	mtest3.o $(LINKLIBS)
@@ -102,13 +102,13 @@ inmem_bench:	inmem_bench.o $(LINKLIBS)
 mtest6:	mtest6.o $(LINKLIBS)
 mplay:	mplay.o $(LINKLIBS)
 
-mdb.o: mdb.c lmdb.h midl.h
+mdb.o: mdb.c dlmdb.h midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c mdb.c
 
 midl.o: midl.c midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c midl.c
 
-mdb.lo: mdb.c lmdb.h midl.h
+mdb.lo: mdb.c dlmdb.h midl.h
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -c mdb.c -o $@
 
 midl.lo: midl.c midl.h
@@ -117,7 +117,7 @@ midl.lo: midl.c midl.h
 %:	%.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-%.o:	%.c lmdb.h
+%.o:	%.c dlmdb.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 
 COV_FLAGS=-fprofile-arcs -ftest-coverage
@@ -133,7 +133,7 @@ coverage: xmtest
 xmtest:	mtest.o xmdb.o xmidl.o
 	gcc -o xmtest mtest.o xmdb.o xmidl.o -pthread $(COV_FLAGS)
 
-xmdb.o: mdb.c lmdb.h midl.h
+xmdb.o: mdb.c dlmdb.h midl.h
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -O0 $(COV_FLAGS) -c mdb.c -o $@
 
 xmidl.o: midl.c midl.h

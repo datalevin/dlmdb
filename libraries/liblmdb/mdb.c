@@ -438,19 +438,18 @@ typedef struct mdb_mutex {
 	int semid;
 	int semnum;
 	int *locked;
+	pthread_mutex_t pmutex;
 } mdb_mutex_t[1], *mdb_mutexref_t;
 
 #define LOCK_MUTEX0(mutex)		mdb_sem_wait(mutex)
-#define UNLOCK_MUTEX(mutex)		do { \
-	struct sembuf sb = { 0, 1, SEM_UNDO }; \
-	sb.sem_num = (mutex)->semnum; \
-	*(mutex)->locked = 0; \
-	semop((mutex)->semid, &sb, 1); \
-} while(0)
+#define UNLOCK_MUTEX(mutex)		mdb_sem_post(mutex)
 
 static int
 mdb_sem_wait(mdb_mutexref_t sem)
 {
+	if (sem->semid == -1)
+		return pthread_mutex_lock(&sem->pmutex);
+
 	int rc, *locked = sem->locked;
 	struct sembuf sb = { 0, -1, SEM_UNDO };
 	sb.sem_num = sem->semnum;
@@ -462,6 +461,24 @@ mdb_sem_wait(mdb_mutexref_t sem)
 		}
 	} while ((rc = errno) == EINTR);
 	return rc;
+}
+
+static int
+mdb_sem_post(mdb_mutexref_t sem)
+{
+	if (sem->semid == -1)
+		return pthread_mutex_unlock(&sem->pmutex);
+
+	{
+		struct sembuf sb = { 0, 1, SEM_UNDO };
+		int rc;
+		sb.sem_num = sem->semnum;
+		*sem->locked = 0;
+		do {
+			rc = semop(sem->semid, &sb, 1);
+		} while (rc && errno == EINTR);
+		return rc;
+	}
 }
 
 #define mdb_mutex_consistent(mutex)	0
@@ -509,6 +526,14 @@ typedef pthread_mutex_t *mdb_mutexref_t;
 	 *	fundamental to the use of memory-mapped files.
 	 */
 #define	GET_PAGESIZE(x)	((x) = sysconf(_SC_PAGE_SIZE))
+#endif
+
+#ifndef _WIN32
+# ifdef MAP_ANONYMOUS
+#  define MDB_MAP_ANON	MAP_ANONYMOUS
+# elif defined(MAP_ANON)
+#  define MDB_MAP_ANON	MAP_ANON
+# endif
 #endif
 
 #define	Z	MDB_FMT_Z	/**< printf/scanf format modifier for size_t */
@@ -2237,6 +2262,8 @@ struct MDB_env {
 #define	MDB_ENV_TXKEY	0x10000000U
 	/** fdatasync is unreliable */
 #define	MDB_FSYNCONLY	0x08000000U
+	/** In-memory env uses process-local lock state (no lockfile). */
+#define	MDB_ENV_INMEM_LOCKS	0x04000000U
 	uint32_t 	me_flags;		/**< @ref mdb_env */
 	unsigned int	me_psize;	/**< DB page size, inited from me_os_psize */
 	unsigned int	me_os_psize;	/**< OS page size, from #GET_PAGESIZE */
@@ -6240,6 +6267,8 @@ int
 mdb_env_sync0(MDB_env *env, int force, pgno_t numpgs)
 {
 	int rc = 0;
+	if (env->me_flags & MDB_INMEMORY)
+		return MDB_SUCCESS;
 	if (env->me_flags & MDB_RDONLY)
 		return EACCES;
 	if (force
@@ -7334,6 +7363,7 @@ done:
 }
 
 static int ESECT mdb_env_share_locks(MDB_env *env, int *excl);
+static int ESECT mdb_env_setup_inmem_locks(MDB_env *env);
 
 static int
 _mdb_txn_commit(MDB_txn *txn)
@@ -7688,6 +7718,24 @@ mdb_env_init_meta(MDB_env *env, MDB_meta *meta)
 	if (len == -1 && ErrCode() == EINTR) continue; \
 	rc = (len >= 0); break; } while(1)
 #endif
+
+	if (env->me_flags & MDB_INMEMORY) {
+		p = (MDB_page *)env->me_map;
+		if (!p)
+			return EINVAL;
+		psize = env->me_psize;
+		memset(p, 0, psize * NUM_METAS);
+		p->mp_pgno = 0;
+		p->mp_flags = P_META;
+		*(MDB_meta *)METADATA(p) = *meta;
+
+		q = (MDB_page *)((char *)p + psize);
+		q->mp_pgno = 1;
+		q->mp_flags = P_META;
+		*(MDB_meta *)METADATA(q) = *meta;
+		return MDB_SUCCESS;
+	}
+
 	DPUTS("writing new meta page");
 
 	psize = env->me_psize;
@@ -7760,7 +7808,8 @@ mdb_env_write_meta(MDB_txn *txn)
 		__sync_synchronize();
 #endif
 		mp->mm_txnid = txn->mt_txnid;
-		if (!(flags & (MDB_NOMETASYNC|MDB_NOSYNC))) {
+		if (!(flags & MDB_INMEMORY) &&
+			!(flags & (MDB_NOMETASYNC|MDB_NOSYNC))) {
 			unsigned meta_size = env->me_psize;
 			rc = (env->me_flags & MDB_MAPASYNC) ? MS_ASYNC : MS_SYNC;
 			ptr = (char *)mp - PAGEHDRSZ;
@@ -7963,6 +8012,8 @@ mdb_env_map(MDB_env *env, void *addr)
 		mmap_flags |= MAP_NOSYNC;
 #endif
 #ifdef MDB_VL32
+	if (flags & MDB_INMEMORY)
+		return ENOSYS;
 	(void) flags;
 	env->me_map = mmap(addr, NUM_METAS * env->me_psize, prot, mmap_flags,
 		env->me_fd, 0);
@@ -7971,13 +8022,23 @@ mdb_env_map(MDB_env *env, void *addr)
 		return ErrCode();
 	}
 #else
-	if (flags & MDB_WRITEMAP) {
+	if (flags & MDB_INMEMORY) {
+#ifdef MDB_MAP_ANON
 		prot |= PROT_WRITE;
-		if (ftruncate(env->me_fd, env->me_mapsize) < 0)
-			return ErrCode();
+		mmap_flags |= MDB_MAP_ANON;
+		env->me_map = mmap(addr, env->me_mapsize, prot, mmap_flags, -1, 0);
+#else
+		return ENOSYS;
+#endif
+	} else {
+		if (flags & MDB_WRITEMAP) {
+			prot |= PROT_WRITE;
+			if (ftruncate(env->me_fd, env->me_mapsize) < 0)
+				return ErrCode();
+		}
+		env->me_map = mmap(addr, env->me_mapsize, prot, mmap_flags,
+			env->me_fd, 0);
 	}
-	env->me_map = mmap(addr, env->me_mapsize, prot, mmap_flags,
-		env->me_fd, 0);
 	if (env->me_map == MAP_FAILED) {
 		env->me_map = NULL;
 		return ErrCode();
@@ -8339,7 +8400,7 @@ mdb_env_open2(MDB_env *env, int prev)
 	 * Kernels 2.6.32.60, 2.6.34.15, 3.2.30, and 3.5.4 are also known
 	 * to be patched.
 	 */
-	{
+	if (!(flags & MDB_INMEMORY)) {
 		struct statfs st;
 		fstatfs(env->me_fd, &st);
 		while (st.f_type == 0xEF53) {
@@ -8378,9 +8439,7 @@ mdb_env_open2(MDB_env *env, int prev)
 	}
 #endif
 
-	if ((i = mdb_env_read_header(env, prev, &meta)) != 0) {
-		if (i != ENOENT)
-			return i;
+	if (flags & MDB_INMEMORY) {
 		DPUTS("new mdbenv");
 		newenv = 1;
 		env->me_psize = env->me_os_psize;
@@ -8390,7 +8449,20 @@ mdb_env_open2(MDB_env *env, int prev)
 		mdb_env_init_meta0(env, &meta);
 		meta.mm_mapsize = DEFAULT_MAPSIZE;
 	} else {
-		env->me_psize = meta.mm_psize;
+		if ((i = mdb_env_read_header(env, prev, &meta)) != 0) {
+			if (i != ENOENT)
+				return i;
+			DPUTS("new mdbenv");
+			newenv = 1;
+			env->me_psize = env->me_os_psize;
+			if (env->me_psize > MAX_PAGESIZE)
+				env->me_psize = MAX_PAGESIZE;
+			memset(&meta, 0, sizeof(meta));
+			mdb_env_init_meta0(env, &meta);
+			meta.mm_mapsize = DEFAULT_MAPSIZE;
+		} else {
+			env->me_psize = meta.mm_psize;
+		}
 	}
 
 	/* Was a mapsize configured? */
@@ -8407,7 +8479,7 @@ mdb_env_open2(MDB_env *env, int prev)
 	}
 	meta.mm_mapsize = env->me_mapsize;
 
-	if (newenv && !(flags & MDB_FIXEDMAP)) {
+	if (newenv && !(flags & MDB_FIXEDMAP) && !(flags & MDB_INMEMORY)) {
 		/* mdb_env_map() may grow the datafile.  Write the metapages
 		 * first, so the file will be valid if initialization fails.
 		 * Except with FIXEDMAP, since we do not yet know mm_address.
@@ -8550,6 +8622,112 @@ PIMAGE_TLS_CALLBACK mdb_tls_cbp = mdb_tls_callback;
 #endif	/* WIN 32/64 */
 #endif	/* !__GNUC__ */
 #endif
+
+/** Setup process-local reader/writer lock state for #MDB_INMEMORY. */
+static int ESECT
+mdb_env_setup_inmem_locks(MDB_env *env)
+{
+#ifdef _WIN32
+	(void)env;
+	return ENOSYS;
+#else
+	int rc;
+	MDB_OFF_T rsize;
+
+	if (!(env->me_flags & MDB_NOTLS)) {
+		rc = pthread_key_create(&env->me_txkey, mdb_env_reader_dest);
+		if (rc)
+			return rc;
+		env->me_flags |= MDB_ENV_TXKEY;
+	}
+
+#ifdef MDB_MAP_ANON
+	rsize = (env->me_maxreaders-1) * sizeof(MDB_reader) + sizeof(MDB_txninfo);
+	env->me_txns = mmap(NULL, rsize, PROT_READ|PROT_WRITE,
+		MAP_SHARED|MDB_MAP_ANON, -1, 0);
+	if (env->me_txns == MAP_FAILED) {
+		env->me_txns = NULL;
+		return ErrCode();
+	}
+#else
+	return ENOSYS;
+#endif
+	env->me_flags |= MDB_ENV_INMEM_LOCKS;
+	memset(env->me_txns, 0, rsize);
+
+#ifdef MDB_USE_POSIX_SEM
+	{
+		static unsigned long mdb_inmem_semseq;
+		unsigned long seq = ++mdb_inmem_semseq;
+		char rname[64], wname[64];
+
+		snprintf(rname, sizeof(rname), "/dlmdb-ir-%ld-%lu",
+			(long)getpid(), seq);
+		snprintf(wname, sizeof(wname), "/dlmdb-iw-%ld-%lu",
+			(long)getpid(), seq);
+
+		env->me_rmutex = sem_open(rname, O_CREAT|O_EXCL, 0600, 1);
+		if (env->me_rmutex == SEM_FAILED)
+			return ErrCode();
+		(void)sem_unlink(rname);
+
+		env->me_wmutex = sem_open(wname, O_CREAT|O_EXCL, 0600, 1);
+		if (env->me_wmutex == SEM_FAILED)
+			return ErrCode();
+		(void)sem_unlink(wname);
+	}
+#elif defined(MDB_USE_SYSV_SEM)
+	{
+		env->me_rmutex->semid = -2;
+		env->me_wmutex->semid = -2;
+		env->me_rmutex->semnum = 0;
+		env->me_wmutex->semnum = 1;
+		env->me_rmutex->locked = NULL;
+		env->me_wmutex->locked = NULL;
+		rc = pthread_mutex_init(&env->me_rmutex->pmutex, NULL);
+		if (rc)
+			return rc;
+		rc = pthread_mutex_init(&env->me_wmutex->pmutex, NULL);
+		if (rc) {
+			pthread_mutex_destroy(&env->me_rmutex->pmutex);
+			return rc;
+		}
+		env->me_rmutex->semid = -1;
+		env->me_wmutex->semid = -1;
+		env->me_txns->mti_semid = -1;
+		env->me_txns->mti_rlocked = 0;
+		env->me_txns->mti_wlocked = 0;
+	}
+#else	/* MDB_USE_POSIX_MUTEX */
+	{
+		pthread_mutexattr_t mattr;
+
+		memset(env->me_txns->mti_rmutex, 0, sizeof(*env->me_txns->mti_rmutex));
+		memset(env->me_txns->mti_wmutex, 0, sizeof(*env->me_txns->mti_wmutex));
+		rc = pthread_mutexattr_init(&mattr);
+		if (rc)
+			return rc;
+		rc = pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_PRIVATE);
+#ifdef MDB_ROBUST_SUPPORTED
+		if (!rc) rc = pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+#endif
+		if (!rc) rc = pthread_mutex_init(env->me_txns->mti_rmutex, &mattr);
+		if (!rc) rc = pthread_mutex_init(env->me_txns->mti_wmutex, &mattr);
+		pthread_mutexattr_destroy(&mattr);
+		if (rc)
+			return rc;
+	}
+#endif
+
+	env->me_txns->mti_magic = MDB_MAGIC;
+	env->me_txns->mti_format = MDB_LOCK_FORMAT;
+	env->me_txns->mti_txnid = 0;
+	env->me_txns->mti_numreaders = 0;
+	env->me_live_reader = 1;
+
+	return MDB_SUCCESS;
+#endif
+}
 
 /** Downgrade the exclusive lock on the region back to shared */
 static int ESECT
@@ -8980,7 +9158,8 @@ fail:
 	 */
 #define	CHANGEABLE	(MDB_NOSYNC|MDB_NOMETASYNC|MDB_MAPASYNC|MDB_NOMEMINIT)
 #define	CHANGELESS	(MDB_FIXEDMAP|MDB_NOSUBDIR|MDB_RDONLY| \
-	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD|MDB_PREVSNAPSHOT)
+	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD|MDB_PREVSNAPSHOT| \
+	MDB_INMEMORY)
 
 #if VALID_FLAGS & PERSISTENT_FLAGS & (CHANGEABLE|CHANGELESS)
 # error "Persistent DB flags & env flags overlap, but both go in mm_flags"
@@ -8989,8 +9168,9 @@ fail:
 int ESECT
 mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode)
 {
-	int rc, excl = -1;
-	MDB_name fname;
+	int rc = MDB_SUCCESS, excl = -1;
+	MDB_name fname = {0};
+	const char *trace_path = path ? path : ":memory:";
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
 		return EINVAL;
@@ -9007,9 +9187,22 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 #endif
 	flags |= env->me_flags;
 
-	rc = mdb_fname_init(path, flags, &fname);
-	if (rc)
-		return rc;
+	if (flags & MDB_INMEMORY) {
+#ifdef _WIN32
+		return ENOSYS;
+#else
+		trace_path = ":memory:";
+		if (flags & (MDB_RDONLY|MDB_FIXEDMAP|MDB_PREVSNAPSHOT))
+			return EINVAL;
+		flags |= MDB_WRITEMAP|MDB_NOSYNC|MDB_NOMETASYNC;
+#endif
+	} else {
+		if (!path)
+			return EINVAL;
+		rc = mdb_fname_init(path, flags, &fname);
+		if (rc)
+			return rc;
+	}
 
 #ifdef MDB_VL32
 #ifdef _WIN32
@@ -9051,7 +9244,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	}
 #endif
 
-	env->me_path = strdup(path);
+	env->me_path = strdup(trace_path);
 	env->me_dbxs = calloc(env->me_maxdbs, sizeof(MDB_dbx));
 	env->me_dbflags = calloc(env->me_maxdbs, sizeof(uint16_t));
 	env->me_dbiseqs = calloc(env->me_maxdbs, sizeof(unsigned int));
@@ -9061,32 +9254,40 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	}
 	env->me_dbxs[FREE_DBI].md_cmp = mdb_cmp_long; /* aligned MDB_INTEGERKEY */
 
-	/* For RDONLY, get lockfile after we know datafile exists */
-	if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
-		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
+	if (flags & MDB_INMEMORY) {
+		if (!(flags & MDB_NOLOCK)) {
+			rc = mdb_env_setup_inmem_locks(env);
+			if (rc)
+				goto leave;
+		}
+	} else {
+		/* For RDONLY, get lockfile after we know datafile exists */
+		if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
+			rc = mdb_env_setup_locks(env, &fname, mode, &excl);
+			if (rc)
+				goto leave;
+			if ((flags & MDB_PREVSNAPSHOT) && !excl) {
+				rc = EAGAIN;
+				goto leave;
+			}
+		}
+
+		rc = mdb_fopen(env, &fname,
+			(flags & MDB_RDONLY) ? MDB_O_RDONLY : MDB_O_RDWR,
+			mode, &env->me_fd);
 		if (rc)
 			goto leave;
-		if ((flags & MDB_PREVSNAPSHOT) && !excl) {
-			rc = EAGAIN;
-			goto leave;
-		}
-	}
-
-	rc = mdb_fopen(env, &fname,
-		(flags & MDB_RDONLY) ? MDB_O_RDONLY : MDB_O_RDWR,
-		mode, &env->me_fd);
-	if (rc)
-		goto leave;
 #ifdef _WIN32
-	rc = mdb_fopen(env, &fname, MDB_O_OVERLAPPED, mode, &env->me_ovfd);
-	if (rc)
-		goto leave;
+		rc = mdb_fopen(env, &fname, MDB_O_OVERLAPPED, mode, &env->me_ovfd);
+		if (rc)
+			goto leave;
 #endif
 
-	if ((flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
-		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
-		if (rc)
-			goto leave;
+		if ((flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
+			rc = mdb_env_setup_locks(env, &fname, mode, &excl);
+			if (rc)
+				goto leave;
+		}
 	}
 
 	if ((rc = mdb_env_open2(env, flags & MDB_PREVSNAPSHOT)) == MDB_SUCCESS) {
@@ -9136,7 +9337,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	}
 
 leave:
-	MDB_TRACE(("%p, %s, %u, %04o", env, path, flags & (CHANGEABLE|CHANGELESS), mode));
+	MDB_TRACE(("%p, %s, %u, %04o", env, trace_path, flags & (CHANGEABLE|CHANGELESS), mode));
 	if (rc) {
 		mdb_env_close0(env, excl);
 	}
@@ -9229,40 +9430,63 @@ mdb_env_close0(MDB_env *env, int excl)
 		for (i = env->me_close_readers; --i >= 0; )
 			if (env->me_txns->mti_readers[i].mr_pid == pid)
 				env->me_txns->mti_readers[i].mr_pid = 0;
+		if (env->me_flags & MDB_ENV_INMEM_LOCKS) {
 #ifdef _WIN32
-		if (env->me_rmutex) {
-			CloseHandle(env->me_rmutex);
-			if (env->me_wmutex) CloseHandle(env->me_wmutex);
-		}
-		/* Windows automatically destroys the mutexes when
-		 * the last handle closes.
-		 */
+			if (env->me_rmutex) {
+				CloseHandle(env->me_rmutex);
+				if (env->me_wmutex) CloseHandle(env->me_wmutex);
+			}
 #elif defined(MDB_USE_POSIX_SEM)
-		if (env->me_rmutex != SEM_FAILED) {
-			sem_close(env->me_rmutex);
+			if (env->me_rmutex != SEM_FAILED)
+				sem_close(env->me_rmutex);
 			if (env->me_wmutex != SEM_FAILED)
 				sem_close(env->me_wmutex);
-			/* If we have the filelock:  If we are the
-			 * only remaining user, clean up semaphores.
-			 */
-			if (excl == 0)
-				mdb_env_excl_lock(env, &excl);
-			if (excl > 0) {
-				sem_unlink(MUTEXNAME(env, 'r'));
-				sem_unlink(MUTEXNAME(env, 'w'));
-			}
-		}
 #elif defined(MDB_USE_SYSV_SEM)
-		if (env->me_rmutex->semid != -1) {
-			/* If we have the filelock:  If we are the
-			 * only remaining user, clean up semaphores.
-			 */
-			if (excl == 0)
-				mdb_env_excl_lock(env, &excl);
-			if (excl > 0)
+			if (env->me_rmutex->semid >= 0)
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
-		}
+			else if (env->me_rmutex->semid == -1) {
+				pthread_mutex_destroy(&env->me_rmutex->pmutex);
+				pthread_mutex_destroy(&env->me_wmutex->pmutex);
+			}
+			env->me_rmutex->semid = -1;
+			env->me_wmutex->semid = -1;
 #endif
+		} else {
+#ifdef _WIN32
+			if (env->me_rmutex) {
+				CloseHandle(env->me_rmutex);
+				if (env->me_wmutex) CloseHandle(env->me_wmutex);
+			}
+			/* Windows automatically destroys the mutexes when
+			 * the last handle closes.
+			 */
+#elif defined(MDB_USE_POSIX_SEM)
+			if (env->me_rmutex != SEM_FAILED) {
+				sem_close(env->me_rmutex);
+				if (env->me_wmutex != SEM_FAILED)
+					sem_close(env->me_wmutex);
+				/* If we have the filelock:  If we are the
+				 * only remaining user, clean up semaphores.
+				 */
+				if (excl == 0)
+					mdb_env_excl_lock(env, &excl);
+				if (excl > 0) {
+					sem_unlink(MUTEXNAME(env, 'r'));
+					sem_unlink(MUTEXNAME(env, 'w'));
+				}
+			}
+#elif defined(MDB_USE_SYSV_SEM)
+			if (env->me_rmutex->semid != -1) {
+				/* If we have the filelock:  If we are the
+				 * only remaining user, clean up semaphores.
+				 */
+				if (excl == 0)
+					mdb_env_excl_lock(env, &excl);
+				if (excl > 0)
+					semctl(env->me_rmutex->semid, 0, IPC_RMID);
+			}
+#endif
+		}
 		munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
 	}
 	if (env->me_lfd != INVALID_HANDLE_VALUE) {
@@ -9285,7 +9509,7 @@ mdb_env_close0(MDB_env *env, int excl)
 #endif
 #endif
 
-	env->me_flags &= ~(MDB_ENV_ACTIVE|MDB_ENV_TXKEY);
+	env->me_flags &= ~(MDB_ENV_ACTIVE|MDB_ENV_TXKEY|MDB_ENV_INMEM_LOCKS);
 }
 
 void ESECT
@@ -15557,7 +15781,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 		goto leave;
 
 	w3 = txn->mt_next_pgno * env->me_psize;
-	{
+	if (!(env->me_flags & MDB_INMEMORY)) {
 		mdb_size_t fsize = 0;
 		if ((rc = mdb_fsize(env->me_fd, &fsize)))
 			goto leave;

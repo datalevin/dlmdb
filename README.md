@@ -14,11 +14,47 @@ features:
 * Prefix compression.
 * DUPSORT iteration optimization.
 * More robust interrupt handling.
+* True in-memory mode (`MDB_INMEMORY`).
 
 These features are critical for Datalevin's high performance: the order
 statistics facilitate query planning; prefix compression couples
 well with triple storage; and the dedicated optimization speeds up the most
 common index scan routines.
+
+## In-memory mode
+
+When persistence is not required, open an environment with
+`MDB_INMEMORY`:
+
+```c
+MDB_env *env = NULL;
+int rc = mdb_env_create(&env);
+if (rc == MDB_SUCCESS)
+    rc = mdb_env_set_mapsize(env, 1ull << 30);
+if (rc == MDB_SUCCESS)
+    rc = mdb_env_open(env, NULL, MDB_INMEMORY, 0664);
+```
+
+Properties:
+
+* No data file or lock file is created.
+* Data lives only in process memory and is lost on `mdb_env_close`.
+* Concurrent readers are supported (single-writer semantics are still enforced).
+
+## In-memory vs file-backed benchmark
+
+`inmem_bench` runs the same write/read workload on file-backed and in-memory
+environments and reports average timings and speedup.
+
+Example run:
+
+```
+./inmem_bench --entries 200000 --value-size 64 --rounds 3 --no-lock
+entries=200000 value_size=64 rounds=3 mapsize=76800000
+file-backed avg: write=95.74 ms read=70.47 ms checksum=25493856
+in-memory  avg: write=69.08 ms read=66.47 ms checksum=25493856
+speedup: write=1.39x read=1.06x
+```
 
 ## Order-statistics API
 

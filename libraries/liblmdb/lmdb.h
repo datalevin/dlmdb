@@ -334,6 +334,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 #define MDB_NOMEMINIT	0x1000000
 	/** use the previous snapshot rather than the latest one */
 #define MDB_PREVSNAPSHOT	0x2000000
+	/** use an anonymous memory map only (no datafile/lockfile path) */
+#define MDB_INMEMORY	0x4000000
 /** @} */
 
 /**	@defgroup	mdb_dbi_open	Database Flags
@@ -557,7 +559,8 @@ int  mdb_env_create(MDB_env **env);
 	 * If this function fails, #mdb_env_close() must be called to discard the #MDB_env handle.
 	 * @param[in] env An environment handle returned by #mdb_env_create()
 	 * @param[in] path The directory in which the database files reside. This
-	 * directory must already exist and be writable.
+	 * directory must already exist and be writable. With #MDB_INMEMORY, this
+	 * parameter is ignored and may be NULL.
 	 * @param[in] flags Special options for this environment. This parameter
 	 * must be set to 0 or by bitwise OR'ing together one or more of the
 	 * values described here.
@@ -665,6 +668,10 @@ int  mdb_env_create(MDB_env **env);
 	 *		types of corruption. If opened with write access, this must be the
 	 *		only process using the environment. This flag is automatically reset
 	 *		after a write transaction is successfully committed.
+	 *	<li>#MDB_INMEMORY
+	 *		Use anonymous memory only, with no datafile or lockfile path.
+	 *		When enabled, this environment is process-local and non-durable,
+	 *		and all data is lost when the environment is closed.
 	 * </ul>
 	 * @param[in] mode The UNIX permissions to set on created files and semaphores.
 	 * This parameter is ignored on Windows.

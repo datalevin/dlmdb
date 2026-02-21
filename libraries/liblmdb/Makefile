@@ -41,7 +41,7 @@ IHDRS	= lmdb.h
 ILIBS	= liblmdb.a liblmdb$(SOEXT)
 IPROGS	= mdb_stat mdb_copy mdb_dump mdb_load mdb_drop
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix count_bench compress_bench sample_bench dup_iter_bench
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_inmem count_bench compress_bench sample_bench dup_iter_bench inmem_bench
 all:	$(ILIBS) $(PROGS)
 
 install: $(ILIBS) $(IPROGS) $(IHDRS)
@@ -66,6 +66,7 @@ test:	all
 	./mtest5
 	rm -rf testdb_prefix*
 	./mtest_prefix
+	./mtest_inmem
 	rm -rf testdb_count*
 	./mtest_count
 
@@ -88,10 +89,12 @@ mtest4:	mtest4.o liblmdb.a
 mtest5:	mtest5.o liblmdb.a
 mtest_count:	mtest_count.o liblmdb.a
 mtest_prefix:	mtest_prefix.o liblmdb.a
+mtest_inmem:	mtest_inmem.o liblmdb.a
 count_bench:	count_bench.o liblmdb.a
 compress_bench:	compress_bench.o liblmdb.a
 sample_bench:	sample_bench.o liblmdb.a
 dup_iter_bench:	dup_iter_bench.o liblmdb.a
+inmem_bench:	inmem_bench.o liblmdb.a
 mtest6:	mtest6.o liblmdb.a
 mplay:	mplay.o liblmdb.a
 

@@ -56,7 +56,7 @@ install: $(ILIBS) $(IPROGS) $(IHDRS)
 	for f in $(IPROGS); do cp $$f $(DESTDIR)$(bindir); done
 	for f in $(ILIBS); do cp $$f $(DESTDIR)$(libdir); done
 	for f in $(IHDRS); do cp $$f $(DESTDIR)$(includedir); done
-	for f in $(IDOCS); do cp $$f $(DESTDIR)$(mandir)/man1; done
+	for f in $(IDOCS); do cp $$f $(DESTDIR)$(mandir)/man1/dl$$f; done
 
 clean:
 	rm -rf $(PROGS) *.[ao] *.[ls]o *~ testdb

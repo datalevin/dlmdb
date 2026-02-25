@@ -18,7 +18,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#include "lmdb.h"
+#include "dlmdb.h"
 
 #define E(expr) CHECK((rc = (expr)) == MDB_SUCCESS, #expr)
 #define CHECK(test, msg) ((test) ? (void)0 : ((void)fprintf(stderr, \

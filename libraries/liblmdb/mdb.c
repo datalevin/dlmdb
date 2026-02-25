@@ -263,7 +263,7 @@ union semun {
 #define MISALIGNED_OK	1
 #endif
 
-#include "lmdb.h"
+#include "dlmdb.h"
 #include "midl.h"
 
 #if (BYTE_ORDER == LITTLE_ENDIAN) == (BYTE_ORDER == BIG_ENDIAN)
@@ -8282,7 +8282,7 @@ mdb_fopen(const MDB_env *env, MDB_name *fname,
 	 * the source data is already in the OS cache.
 	 *
 	 * The lockfile needs FD_CLOEXEC (close file descriptor on exec*())
-	 * to avoid the flock() issues noted under Caveats in lmdb.h.
+	 * to avoid the flock() issues noted under Caveats in dlmdb.h.
 	 * Also set it for other filehandles which the user cannot get at
 	 * and close himself, which he may need after fork().  I.e. all but
 	 * me_fd, which programs do use via mdb_env_get_fd().

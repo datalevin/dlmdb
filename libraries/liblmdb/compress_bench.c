@@ -1,4 +1,4 @@
-#include "lmdb.h"
+#include "dlmdb.h"
 
 #include <errno.h>
 #include <inttypes.h>

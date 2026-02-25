@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "lmdb.h"
+#include "dlmdb.h"
 
 #define VPRINTF(...) do { if (verbose) printf(__VA_ARGS__); } while (0)
 

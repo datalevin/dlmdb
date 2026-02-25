@@ -1,7 +1,7 @@
-/** @file lmdb.h
- *	@brief Lightning memory-mapped database library
+/** @file dlmdb.h
+ *	@brief Datalevin Lightning memory-mapped database library
  *
- *	@mainpage	Lightning Memory-Mapped Database Manager (LMDB)
+ *	@mainpage	Lightning Memory-Mapped Database Manager (DLMDB)
  *
  *	@section intro_sec Introduction
  *	LMDB is a Btree-based database management library modeled loosely on the
@@ -163,8 +163,8 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#ifndef _LMDB_H_
-#define _LMDB_H_
+#ifndef _DLMDB_H_
+#define _DLMDB_H_
 
 #include <sys/types.h>
 #include <inttypes.h>
@@ -217,7 +217,7 @@ typedef	void *mdb_filehandle_t;
 typedef int mdb_filehandle_t;
 #endif
 
-/** @defgroup mdb LMDB API
+/** @defgroup mdb DLMDB API
  *	@{
  *	@brief OpenLDAP Lightning Memory-Mapped Database Manager
  */
@@ -1790,10 +1790,10 @@ int	mdb_reader_check(MDB_env *env, int *dead);
 #endif
 /** @page tools LMDB Command Line Tools
 	The following describes the command line tools that are available for LMDB.
-	\li \ref mdb_copy_1
-	\li \ref mdb_dump_1
-	\li \ref mdb_load_1
-	\li \ref mdb_stat_1
+	\li \ref dlmdb_copy_1
+	\li \ref dlmdb_dump_1
+	\li \ref dlmdb_load_1
+	\li \ref dlmdb_stat_1
 */
 
-#endif /* _LMDB_H_ */
+#endif /* _DLMDB_H_ */

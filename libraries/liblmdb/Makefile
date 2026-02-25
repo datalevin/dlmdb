@@ -27,7 +27,7 @@ CFLAGS	= $(THREADS) $(OPT) $(W) $(XCFLAGS)
 LDLIBS	=
 SOLIBS	=
 SOEXT	= .so
-prefix	= /usr/local
+prefix	?= /usr/local
 exec_prefix = $(prefix)
 bindir = $(exec_prefix)/bin
 libdir = $(exec_prefix)/lib
@@ -37,11 +37,15 @@ mandir = $(datarootdir)/man
 
 ########################################################################
 
-IHDRS	= lmdb.h
-ILIBS	= liblmdb.a liblmdb$(SOEXT)
-IPROGS	= mdb_stat mdb_copy mdb_dump mdb_load mdb_drop
-IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
+IHDRS	= dlmdb.h
+LIBS	= libdlmdb.a
+SHLIBS	= libdlmdb$(SOEXT)
+ILIBS	= $(LIBS) $(SHLIBS)
+LINKLIBS	= $(LIBS)
+IPROGS	= dlmdb_stat dlmdb_copy dlmdb_dump dlmdb_load dlmdb_drop
+IDOCS	= dlmdb_stat.1 dlmdb_copy.1 dlmdb_dump.1 dlmdb_load.1 dlmdb_drop.1
 PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_inmem count_bench compress_bench sample_bench dup_iter_bench inmem_bench
+
 all:	$(ILIBS) $(PROGS)
 
 install: $(ILIBS) $(IPROGS) $(IHDRS)
@@ -70,33 +74,33 @@ test:	all
 	rm -rf testdb_count*
 	./mtest_count
 
-liblmdb.a:	mdb.o midl.o
+libdlmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
 
-liblmdb$(SOEXT):	mdb.lo midl.lo
+libdlmdb$(SOEXT):	mdb.lo midl.lo
 #	$(CC) $(LDFLAGS) -pthread -shared -Wl,-Bsymbolic -o $@ mdb.o midl.o $(SOLIBS)
 	$(CC) $(LDFLAGS) -pthread -shared -o $@ mdb.lo midl.lo $(SOLIBS)
 
-mdb_stat: mdb_stat.o liblmdb.a
-mdb_copy: mdb_copy.o liblmdb.a
-mdb_dump: mdb_dump.o liblmdb.a
-mdb_load: mdb_load.o liblmdb.a
-mdb_drop: mdb_drop.o liblmdb.a
-mtest:    mtest.o    liblmdb.a
-mtest2:	mtest2.o liblmdb.a
-mtest3:	mtest3.o liblmdb.a
-mtest4:	mtest4.o liblmdb.a
-mtest5:	mtest5.o liblmdb.a
-mtest_count:	mtest_count.o liblmdb.a
-mtest_prefix:	mtest_prefix.o liblmdb.a
-mtest_inmem:	mtest_inmem.o liblmdb.a
-count_bench:	count_bench.o liblmdb.a
-compress_bench:	compress_bench.o liblmdb.a
-sample_bench:	sample_bench.o liblmdb.a
-dup_iter_bench:	dup_iter_bench.o liblmdb.a
-inmem_bench:	inmem_bench.o liblmdb.a
-mtest6:	mtest6.o liblmdb.a
-mplay:	mplay.o liblmdb.a
+dlmdb_stat: dlmdb_stat.o $(LINKLIBS)
+dlmdb_copy: dlmdb_copy.o $(LINKLIBS)
+dlmdb_dump: dlmdb_dump.o $(LINKLIBS)
+dlmdb_load: dlmdb_load.o $(LINKLIBS)
+dlmdb_drop: dlmdb_drop.o $(LINKLIBS)
+mtest:  mtest.o $(LINKLIBS)
+mtest2:	mtest2.o $(LINKLIBS)
+mtest3:	mtest3.o $(LINKLIBS)
+mtest4:	mtest4.o $(LINKLIBS)
+mtest5:	mtest5.o $(LINKLIBS)
+mtest_count:	mtest_count.o $(LINKLIBS)
+mtest_prefix:	mtest_prefix.o $(LINKLIBS)
+mtest_inmem:	mtest_inmem.o $(LINKLIBS)
+count_bench:	count_bench.o $(LINKLIBS)
+compress_bench:	compress_bench.o $(LINKLIBS)
+sample_bench:	sample_bench.o $(LINKLIBS)
+dup_iter_bench:	dup_iter_bench.o $(LINKLIBS)
+inmem_bench:	inmem_bench.o $(LINKLIBS)
+mtest6:	mtest6.o $(LINKLIBS)
+mplay:	mplay.o $(LINKLIBS)
 
 mdb.o: mdb.c lmdb.h midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c mdb.c

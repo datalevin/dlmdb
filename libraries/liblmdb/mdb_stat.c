@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "lmdb.h"
+#include "dlmdb.h"
 
 #define Z	MDB_FMT_Z
 #define Yu	MDB_PRIy(u)

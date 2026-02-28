@@ -11,7 +11,7 @@
  *   value_size: size of each value in bytes (default: 128)
  */
 
-#include "lmdb.h"
+#include "dlmdb.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

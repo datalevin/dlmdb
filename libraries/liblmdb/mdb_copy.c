@@ -20,7 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
-#include "lmdb.h"
+#include "dlmdb.h"
 
 static volatile sig_atomic_t gotsig;
 static volatile MDB_env *sig_env;

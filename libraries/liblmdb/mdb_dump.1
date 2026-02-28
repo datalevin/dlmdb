@@ -1,10 +1,10 @@
-.TH MDB_DUMP 1 "2017/07/31" "LMDB 0.9.70"
+.TH MDB_DUMP 1 "2017/07/31" "DLMDB 0.9.70"
 .\" Copyright 2014-2021 Howard Chu, Symas Corp. All Rights Reserved.
 .\" Copying restrictions apply.  See COPYRIGHT/LICENSE.
 .SH NAME
-mdb_dump \- LMDB environment export tool
+mdb_dump \- DLMDB environment export tool
 .SH SYNOPSIS
-.B mdb_dump
+.B dlmdb_dump
 [\c
 .BR \-V ]
 [\c
@@ -23,11 +23,11 @@ mdb_dump \- LMDB environment export tool
 .BR \ envpath
 .SH DESCRIPTION
 The
-.B mdb_dump
+.B dlmdb_dump
 utility reads a database and writes its contents to the
 standard output using a portable flat-text format
 understood by the
-.BR mdb_load (1)
+.BR dlmdb_load (1)
 utility.
 .SH OPTIONS
 .TP
@@ -42,7 +42,7 @@ List the databases stored in the environment. Just the
 names will be listed, no data will be output.
 .TP
 .BR \-n
-Dump an LMDB database which does not use subdirectories.
+Dump an DLMDB database which does not use subdirectories.
 .TP
 .BR \-v
 Use the previous environment state instead of the latest state.
@@ -69,13 +69,13 @@ a diagnostic message being written to standard error.
 
 Dumping databases that use user-defined comparison functions will output
 records with the ordering imposed by those comparison functions. If
-.B mdb_load
+.B dlmdb_load
 is invoked without including the
 .B -a
 option when reloading those records, the new databases will likely be
 damaged beyond repair, permitting neither record storage nor retrieval.
 
 .SH "SEE ALSO"
-.BR mdb_load (1)
+.BR dlmdb_load (1)
 .SH AUTHOR
 Howard Chu of Symas Corporation <http://www.symas.com>

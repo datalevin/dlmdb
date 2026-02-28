@@ -95,6 +95,7 @@ pf_trace_ops(void)
 }
 
 static void test_prefix_leaf_splits(void);
+static void test_prefix_split_trunk_reencode_regression(void);
 static void test_prefix_alternating_prefixes(void);
 static void test_prefix_update_reinsert(void);
 static void test_prefix_dupsort_cursor_walk(void);
@@ -109,6 +110,7 @@ static void test_prefix_dupsort_inline_cmp_negative(void);
 static void test_prefix_dupsort_trunk_swap_inline(void);
 static void test_prefix_dupsort_trunk_swap_promote(void);
 static void test_prefix_dupsort_trunk_key_shift_no_value_change(void);
+static void test_prefix_dupsort_split_replace_combinations(void);
 static void test_prefix_concurrent_reads(void);
 static void test_prefix_tuples_ave_range_hit(void);
 static void test_plain_tuples_get_both_range(void);
@@ -1658,6 +1660,97 @@ test_prefix_leaf_splits(void)
 }
 
 static void
+test_prefix_split_trunk_reencode_regression(void)
+{
+	static const char *dir = "testdb_prefix_split_trunk_reencode";
+	int observed_split = 0;
+
+	for (size_t base_count = 96; base_count <= 256; base_count += 8) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn = NULL;
+		MDB_dbi dbi;
+		MDB_stat before = {0}, after = {0};
+		int rc;
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL,
+		    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+
+		for (size_t i = 0; i < base_count; ++i) {
+			char keybuf[256];
+			char valbuf[64];
+			int kw = snprintf(keybuf, sizeof(keybuf),
+			    "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+			    "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-%05zu", i);
+			int vw = snprintf(valbuf, sizeof(valbuf), "seed-%05zu", i);
+			if (kw < 0 || (size_t)kw >= sizeof(keybuf) ||
+			    vw < 0 || (size_t)vw >= sizeof(valbuf)) {
+				fprintf(stderr, "split regression: snprintf failed at %zu\n", i);
+				exit(EXIT_FAILURE);
+			}
+			MDB_val key = {(size_t)kw, keybuf};
+			MDB_val data = {(size_t)vw, valbuf};
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+
+		CHECK_CALL(mdb_stat(txn, dbi, &before));
+		if (before.ms_leaf_pages != 1) {
+			mdb_txn_abort(txn);
+			mdb_env_close(env);
+			cleanup_env_dir(dir);
+			continue;
+		}
+
+		char front_key_buf[128];
+		int fkw = snprintf(front_key_buf, sizeof(front_key_buf),
+		    "aaaa-regression-front-%03zu", base_count);
+		if (fkw < 0 || (size_t)fkw >= sizeof(front_key_buf)) {
+			fprintf(stderr, "split regression: front key formatting failed\n");
+			exit(EXIT_FAILURE);
+		}
+		const char *front_data_str = "front-data";
+		MDB_val front_key = {(size_t)fkw, front_key_buf};
+		MDB_val front_data = {strlen(front_data_str), (void *)front_data_str};
+
+		rc = mdb_put(txn, dbi, &front_key, &front_data, 0);
+		if (rc == MDB_PAGE_FULL) {
+			fprintf(stderr,
+			    "split regression: unexpected MDB_PAGE_FULL at base_count=%zu "
+			    "(leaf pages before=%" PRIuPTR ")\n",
+			    base_count, (uintptr_t)before.ms_leaf_pages);
+			exit(EXIT_FAILURE);
+		}
+		CHECK(rc, "mdb_put(front key)");
+
+		CHECK_CALL(mdb_stat(txn, dbi, &after));
+		if (after.ms_leaf_pages > before.ms_leaf_pages)
+			observed_split = 1;
+
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		MDB_txn *rtxn = NULL;
+		MDB_val got = {0, NULL};
+		CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn));
+		CHECK_CALL(mdb_get(rtxn, dbi, &front_key, &got));
+		if (got.mv_size != front_data.mv_size ||
+		    memcmp(got.mv_data, front_data.mv_data, got.mv_size) != 0) {
+			fprintf(stderr, "split regression: front key value mismatch\n");
+			exit(EXIT_FAILURE);
+		}
+		mdb_txn_abort(rtxn);
+
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+
+	if (!observed_split) {
+		fprintf(stderr,
+		    "split regression: did not exercise trunk-change split scenario\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void
 test_prefix_alternating_prefixes(void)
 {
 	static const char *dir = "testdb_prefix_alternating";
@@ -2608,6 +2701,139 @@ test_prefix_dupsort_trunk_swap_promote(void)
 
 	mdb_env_close(env);
 	cleanup_env_dir(dir);
+}
+
+static void
+test_prefix_dupsort_split_replace_combinations(void)
+{
+	static const char *dir = "testdb_prefix_dupsort_split_replace";
+	static const char *target_key = "dup-inline-split-target";
+	static const char *seed_a_str = "dup-inline-0500";
+	static const char *seed_b_str = "dup-inline-0600";
+	int observed_split = 0;
+
+	for (size_t base_count = 32; base_count <= 192; base_count += 4) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn = NULL;
+		MDB_dbi dbi;
+		MDB_stat before = {0}, after = {0};
+		MDB_val key = { strlen(target_key), (void *)target_key };
+		MDB_val seed_a = { strlen(seed_a_str), (void *)seed_a_str };
+		MDB_val seed_b = { strlen(seed_b_str), (void *)seed_b_str };
+		char grow_dup[520];
+		char trunk_dup[520];
+		size_t dup_len = 0;
+		int rc;
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL,
+		    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED | MDB_DUPSORT, &dbi));
+
+		for (size_t i = 0; i < base_count; ++i) {
+			char keybuf[192];
+			char valbuf[128];
+			int kw = snprintf(keybuf, sizeof(keybuf),
+			    "zzzz-inline-fill-mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-%05zu",
+			    i);
+			int vw = snprintf(valbuf, sizeof(valbuf),
+			    "fillval-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-%05zu",
+			    i);
+			if (kw < 0 || (size_t)kw >= sizeof(keybuf) ||
+			    vw < 0 || (size_t)vw >= sizeof(valbuf)) {
+				fprintf(stderr, "dupsort split-replace: filler snprintf failed\n");
+				exit(EXIT_FAILURE);
+			}
+			MDB_val fill_key = { (size_t)kw, keybuf };
+			MDB_val fill_val = { (size_t)vw, valbuf };
+			CHECK_CALL(mdb_put(txn, dbi, &fill_key, &fill_val, 0));
+		}
+
+		CHECK_CALL(mdb_put(txn, dbi, &key, &seed_a, 0));
+		CHECK_CALL(mdb_put(txn, dbi, &key, &seed_b, 0));
+		CHECK_CALL(mdb_stat(txn, dbi, &before));
+
+		if (before.ms_leaf_pages != 1) {
+			mdb_txn_abort(txn);
+			mdb_env_close(env);
+			cleanup_env_dir(dir);
+			continue;
+		}
+		size_t maxkey = (size_t)mdb_env_get_maxkeysize(env);
+		if (maxkey < 64) {
+			fprintf(stderr, "dupsort split-replace: max key too small (%zu)\n", maxkey);
+			exit(EXIT_FAILURE);
+		}
+		dup_len = maxkey > 8 ? maxkey - 8 : maxkey;
+		if (dup_len > sizeof(grow_dup) - 1)
+			dup_len = sizeof(grow_dup) - 1;
+		if (dup_len < 128 && maxkey >= 128)
+			dup_len = 128;
+
+		int gw = snprintf(grow_dup, dup_len + 1,
+		    "dup-inline-grow-%03zu-", base_count);
+		if (gw < 0 || (size_t)gw >= dup_len) {
+			fprintf(stderr, "dupsort split-replace: grow dup snprintf failed\n");
+			exit(EXIT_FAILURE);
+		}
+		memset(grow_dup + gw, 'x', dup_len - (size_t)gw);
+		grow_dup[dup_len] = '\0';
+		MDB_val grow_data = { dup_len, grow_dup };
+		rc = mdb_put(txn, dbi, &key, &grow_data, 0);
+		if (rc == MDB_PAGE_FULL) {
+			fprintf(stderr,
+			    "dupsort split-replace: unexpected MDB_PAGE_FULL during grow "
+			    "(base_count=%zu)\n", base_count);
+			exit(EXIT_FAILURE);
+		}
+		CHECK(rc, "mdb_put grow duplicate");
+
+		int tw = snprintf(trunk_dup, dup_len + 1,
+		    "aaa-inline-trunk-%03zu-", base_count);
+		if (tw < 0 || (size_t)tw >= dup_len) {
+			fprintf(stderr, "dupsort split-replace: trunk dup snprintf failed\n");
+			exit(EXIT_FAILURE);
+		}
+		memset(trunk_dup + tw, 'a', dup_len - (size_t)tw);
+		trunk_dup[dup_len] = '\0';
+		MDB_val trunk_data = { dup_len, trunk_dup };
+		rc = mdb_put(txn, dbi, &key, &trunk_data, 0);
+		if (rc == MDB_PAGE_FULL) {
+			fprintf(stderr,
+			    "dupsort split-replace: unexpected MDB_PAGE_FULL during trunk shift "
+			    "(base_count=%zu)\n", base_count);
+			exit(EXIT_FAILURE);
+		}
+		CHECK(rc, "mdb_put trunk duplicate");
+
+		CHECK_CALL(mdb_stat(txn, dbi, &after));
+		if (after.ms_leaf_pages > before.ms_leaf_pages)
+			observed_split = 1;
+
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		{
+			const char *expected[] = {
+				trunk_dup,
+				seed_a_str,
+				seed_b_str,
+				grow_dup
+			};
+			assert_dup_sequence(env, dbi, target_key,
+			    expected, ARRAY_SIZE(expected));
+		}
+
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+
+		if (observed_split)
+			break;
+	}
+
+	if (!observed_split) {
+		fprintf(stderr,
+		    "dupsort split-replace: did not observe split-replace combinations\n");
+		exit(EXIT_FAILURE);
+	}
 }
 
 static void
@@ -3717,6 +3943,7 @@ main(void)
 	test_prefix_encoded_range_regression();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
+	test_prefix_split_trunk_reencode_regression();
 	test_prefix_alternating_prefixes();
 	test_prefix_update_reinsert();
 	test_prefix_dupsort_smoke();
@@ -3727,6 +3954,7 @@ main(void)
 	test_prefix_dupsort_trunk_key_shift_no_value_change();
 	test_prefix_dupsort_trunk_swap_inline();
 	test_prefix_dupsort_trunk_swap_promote();
+	test_prefix_dupsort_split_replace_combinations();
 	test_prefix_dupsort_fuzz();
 	test_prefix_concurrent_reads();
 	test_nested_txn_rollback();

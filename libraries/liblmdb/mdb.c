@@ -1460,26 +1460,35 @@ mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 	 * A valid encoding must round-trip with the canonical shared prefix.
 	 */
 	{
-		MDB_val decoded_key = { full_len, decoded };
-		size_t canonical_shared = mdb_leaf_shared_prefix(trunk, &decoded_key);
-		size_t canonical_used = mdb_varint_length(canonical_shared);
-		size_t canonical_suffix = full_len - canonical_shared;
-		unsigned char hdr[MDB_VARINT_MAX];
-		size_t hdr_len;
+		const unsigned char *trunk_bytes =
+		    (const unsigned char *)trunk->mv_data;
+		size_t canonical_shared = (size_t)shared;
+		size_t trunk_tail = trunk->mv_size - canonical_shared;
+		size_t extra = 0;
 
-		if (canonical_used > encoded_len ||
-		    canonical_used + canonical_suffix != encoded_len)
+		/* decoded starts with exactly 'shared' trunk bytes; only scan tail */
+		while (extra < suffix_len && extra < trunk_tail &&
+		    trunk_bytes[canonical_shared + extra] == encoded[used + extra])
+			extra++;
+
+		/* Any extra shared bytes mean the payload wasn't canonically encoded. */
+		if (extra)
 			goto raw_fallback;
 
-		hdr_len = mdb_varint_encode(canonical_shared, hdr);
-		if (hdr_len != canonical_used ||
-		    memcmp(encoded, hdr, hdr_len) != 0)
-			goto raw_fallback;
+		/* Fast path: one-byte shared prefix header is always canonical. */
+		if (!(used == 1 && encoded[0] < 0x80)) {
+			size_t canonical_used = mdb_varint_length(canonical_shared);
+			unsigned char hdr[MDB_VARINT_MAX];
+			size_t hdr_len;
 
-		if (canonical_suffix &&
-		    memcmp(encoded + hdr_len, decoded + canonical_shared,
-			canonical_suffix) != 0)
-			goto raw_fallback;
+			if (canonical_used != used)
+				goto raw_fallback;
+
+			hdr_len = mdb_varint_encode(canonical_shared, hdr);
+			if (hdr_len != canonical_used ||
+			    memcmp(encoded, hdr, hdr_len) != 0)
+				goto raw_fallback;
+		}
 	}
 
 	out->mv_data = decoded;
@@ -2983,6 +2992,64 @@ mdb_prefix_decoded_length(size_t trunk_len, const unsigned char *encoded,
 	return decoded_len;
 }
 
+/* Parse a prefix-compressed payload and verify it is canonical against trunk.
+ * Returns 1 when canonical prefix encoding is confirmed, else 0 (treat raw). */
+static int
+mdb_prefix_decode_canonical(const MDB_val *trunk, const unsigned char *encoded,
+	size_t encoded_len, size_t *shared_out, size_t *used_out,
+	size_t *full_len_out)
+{
+	uint64_t shared64 = 0;
+	size_t used = 0, shared, suffix_len, full_len;
+	const unsigned char *trunk_bytes;
+	size_t trunk_tail, extra = 0;
+
+	if (!trunk || !trunk->mv_data || !encoded || !encoded_len)
+		return 0;
+
+	if (mdb_prefix_decode_shared(encoded, encoded_len, &shared64, &used) != MDB_SUCCESS)
+		return 0;
+	if (shared64 > trunk->mv_size || used > encoded_len)
+		return 0;
+
+	shared = (size_t)shared64;
+	suffix_len = encoded_len - used;
+	if (shared > SIZE_MAX - suffix_len)
+		return 0;
+	full_len = shared + suffix_len;
+
+	trunk_bytes = (const unsigned char *)trunk->mv_data;
+	trunk_tail = trunk->mv_size - shared;
+
+	/* Canonical encoding must not leave additional trunk bytes in suffix. */
+	while (extra < suffix_len && extra < trunk_tail &&
+	    trunk_bytes[shared + extra] == encoded[used + extra])
+		extra++;
+	if (extra)
+		return 0;
+
+	/* Fast path: single-byte header is canonical by construction. */
+	if (!(used == 1 && encoded[0] < 0x80)) {
+		size_t canonical_used = mdb_varint_length(shared);
+		unsigned char hdr[MDB_VARINT_MAX];
+		size_t hdr_len;
+
+		if (canonical_used != used)
+			return 0;
+		hdr_len = mdb_varint_encode(shared, hdr);
+		if (hdr_len != canonical_used || memcmp(encoded, hdr, hdr_len) != 0)
+			return 0;
+	}
+
+	if (shared_out)
+		*shared_out = shared;
+	if (used_out)
+		*used_out = used;
+	if (full_len_out)
+		*full_len_out = full_len;
+	return 1;
+}
+
 static int
 mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 	MDB_prefix_stride_entry *entry)
@@ -3502,6 +3569,23 @@ fail:
 }
 
 static void
+mdb_prefix_scratch_reset(MDB_prefix_scratch *scratch)
+{
+	if (!scratch)
+		return;
+
+	memset(&scratch->measure_cache, 0, sizeof(scratch->measure_cache));
+
+	if (scratch->stride_cache.entries) {
+		for (unsigned int i = 0; i < scratch->stride_cache.capacity; ++i) {
+			MDB_prefix_stride_entry *entry = &scratch->stride_cache.entries[i];
+			if (entry->pgno != P_INVALID)
+				entry->valid = 0;
+		}
+	}
+}
+
+static void
 mdb_prefix_scratch_clear(MDB_prefix_scratch *scratch)
 {
 	if (!scratch)
@@ -3641,9 +3725,17 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 		entries[out].shared_prefix = UINT16_MAX;
 
 		size_t full_len = entries[out].encoded_len;
-		if (i != 0 && old_trunk && old_trunk->mv_data && entries[out].encoded_len > 0)
-			full_len = mdb_prefix_decoded_length(old_trunk->mv_size,
-			    entries[out].encoded_key, entries[out].encoded_len);
+		if (i != 0 && old_trunk && old_trunk->mv_data &&
+		    entries[out].encoded_len > 0) {
+			size_t shared = 0, used = 0;
+			if (mdb_prefix_decode_canonical(old_trunk,
+			    entries[out].encoded_key, entries[out].encoded_len,
+			    &shared, &used, &full_len)) {
+				if (shared <= UINT16_MAX)
+					entries[out].shared_prefix = (unsigned short)shared;
+				entries[out].encoded_used = (unsigned short)used;
+			}
+		}
 
 		entries[out].key.mv_size = full_len;
 		total_key_bytes += full_len;
@@ -3672,14 +3764,27 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 				if (entry->key.mv_size > copy_len)
 					memset(key_cursor + copy_len, 0,
 					    entry->key.mv_size - copy_len);
+			} else if (entry->shared_prefix != UINT16_MAX &&
+			    entry->encoded_used <= entry->encoded_len &&
+			    old_trunk && old_trunk->mv_data &&
+			    entry->shared_prefix <= old_trunk->mv_size) {
+				size_t shared = entry->shared_prefix;
+				size_t suffix_len = entry->encoded_len - entry->encoded_used;
+				if (shared)
+					memcpy(key_cursor, old_trunk->mv_data, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entry->encoded_key + entry->encoded_used,
+					    suffix_len);
 			} else {
-				MDB_val full = { entry->key.mv_size, key_cursor };
-				rc = mdb_leaf_decode_key(old_trunk, entry->encoded_key,
-				    entry->encoded_len, &full, key_cursor, entry->key.mv_size, 0,
-				    NULL);
-				if (rc != MDB_SUCCESS)
-					return rc;
-				entry->key.mv_size = full.mv_size;
+				size_t copy_len = entry->encoded_len;
+				if (copy_len > entry->key.mv_size)
+					copy_len = entry->key.mv_size;
+				if (copy_len)
+					memcpy(key_cursor, entry->encoded_key, copy_len);
+				if (entry->key.mv_size > copy_len)
+					memset(key_cursor + copy_len, 0,
+					    entry->key.mv_size - copy_len);
 			}
 		}
 		key_cursor += entry->key.mv_size;
@@ -3817,8 +3922,17 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 			entries[i].key.mv_size = old_trunk.mv_size;
 		} else {
 			if (trunk_bytes && src->mn_ksize > 0) {
-				entries[i].key.mv_size = mdb_prefix_decoded_length(
-				    trunk_len, entries[i].encoded_key, entries[i].encoded_len);
+				size_t shared = 0, used = 0, full_len = entries[i].encoded_len;
+				if (mdb_prefix_decode_canonical(&old_trunk,
+				    entries[i].encoded_key, entries[i].encoded_len,
+				    &shared, &used, &full_len)) {
+					if (shared <= UINT16_MAX)
+						entries[i].shared_prefix = (unsigned short)shared;
+					entries[i].encoded_used = (unsigned short)used;
+					entries[i].key.mv_size = full_len;
+				} else {
+					entries[i].key.mv_size = entries[i].encoded_len;
+				}
 			} else {
 				entries[i].key.mv_size = entries[i].encoded_len;
 			}
@@ -3848,14 +3962,27 @@ mdb_prefix_inline_measure_after_insert(MDB_cursor *mc, MDB_page *mp,
 				if (entries[i].key.mv_size > copy_len)
 					memset(key_cursor + copy_len, 0,
 					    entries[i].key.mv_size - copy_len);
-			} else if (entries[i].encoded_key) {
-				MDB_val full = { entries[i].key.mv_size, key_cursor };
-				rc = mdb_leaf_decode_key(&old_trunk, entries[i].encoded_key,
-				    entries[i].encoded_len, &full, key_cursor,
-				    entries[i].key.mv_size, 0, NULL);
-				if (rc != MDB_SUCCESS)
-					return rc;
-				entries[i].key.mv_size = full.mv_size;
+			} else if (entries[i].encoded_key &&
+			    entries[i].shared_prefix != UINT16_MAX &&
+			    trunk_bytes &&
+			    entries[i].encoded_used <= entries[i].encoded_len &&
+			    entries[i].shared_prefix <= trunk_len) {
+				size_t shared = entries[i].shared_prefix;
+				size_t suffix_len = entries[i].encoded_len - entries[i].encoded_used;
+				if (shared)
+					memcpy(key_cursor, trunk_bytes, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entries[i].encoded_key + entries[i].encoded_used,
+					    suffix_len);
+			} else if (entries[i].encoded_key && entries[i].encoded_len) {
+				size_t copy_len = entries[i].encoded_len;
+				if (copy_len > entries[i].key.mv_size)
+					copy_len = entries[i].key.mv_size;
+				memcpy(key_cursor, entries[i].encoded_key, copy_len);
+				if (entries[i].key.mv_size > copy_len)
+					memset(key_cursor + copy_len,
+					    0, entries[i].key.mv_size - copy_len);
 			}
 			entries[i].key.mv_data = key_cursor;
 		}
@@ -4030,8 +4157,17 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 				entries[i].key.mv_size = old_trunk->mv_size;
 			} else {
 				if (trunk_bytes && src->mn_ksize > 0) {
-					entries[i].key.mv_size = mdb_prefix_decoded_length(
-					    trunk_len, entries[i].encoded_key, entries[i].encoded_len);
+					size_t shared = 0, used = 0, full_len = entries[i].encoded_len;
+					if (mdb_prefix_decode_canonical(&trunk_ref,
+					    entries[i].encoded_key, entries[i].encoded_len,
+					    &shared, &used, &full_len)) {
+						if (shared <= UINT16_MAX)
+							entries[i].shared_prefix = (unsigned short)shared;
+						entries[i].encoded_used = (unsigned short)used;
+						entries[i].key.mv_size = full_len;
+					} else {
+						entries[i].key.mv_size = entries[i].encoded_len;
+					}
 				} else {
 					entries[i].key.mv_size = entries[i].encoded_len;
 				}
@@ -4061,14 +4197,27 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 				if (entries[i].key.mv_size > copy_len)
 					memset(key_cursor + copy_len, 0,
 					    entries[i].key.mv_size - copy_len);
-			} else if (entries[i].encoded_key) {
-				MDB_val full = { entries[i].key.mv_size, key_cursor };
-				rc = mdb_leaf_decode_key(&trunk_ref, entries[i].encoded_key,
-				    entries[i].encoded_len, &full, key_cursor,
-				    entries[i].key.mv_size, 0, NULL);
-				if (rc != MDB_SUCCESS)
-					return rc;
-				entries[i].key.mv_size = full.mv_size;
+			} else if (entries[i].encoded_key &&
+			    entries[i].shared_prefix != UINT16_MAX &&
+			    trunk_bytes &&
+			    entries[i].encoded_used <= entries[i].encoded_len &&
+			    entries[i].shared_prefix <= trunk_len) {
+				size_t shared = entries[i].shared_prefix;
+				size_t suffix_len = entries[i].encoded_len - entries[i].encoded_used;
+				if (shared)
+					memcpy(key_cursor, trunk_bytes, shared);
+				if (suffix_len)
+					memcpy(key_cursor + shared,
+					    entries[i].encoded_key + entries[i].encoded_used,
+					    suffix_len);
+			} else if (entries[i].encoded_key && entries[i].encoded_len) {
+				size_t copy_len = entries[i].encoded_len;
+				if (copy_len > entries[i].key.mv_size)
+					copy_len = entries[i].key.mv_size;
+				memcpy(key_cursor, entries[i].encoded_key, copy_len);
+				if (entries[i].key.mv_size > copy_len)
+					memset(key_cursor + copy_len,
+					    0, entries[i].key.mv_size - copy_len);
 			}
 		}
 		entries[i].key.mv_data = key_cursor;
@@ -7025,7 +7174,7 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 		txn->mt_numdbs = 0;		/* prevent further DBI activity */
 		txn->mt_flags |= MDB_TXN_FINISHED;
 		if (mode & MDB_END_RESET)
-			mdb_prefix_scratch_clear(&txn->mt_prefix);
+			mdb_prefix_scratch_reset(&txn->mt_prefix);
 
 	} else if (!F_ISSET(txn->mt_flags, MDB_TXN_FINISHED)) {
 		pgno_t *pghead = env->me_pghead;
@@ -7048,11 +7197,11 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 			env->me_pglast = 0;
 
 			env->me_txn = NULL;
-			/* env->me_txn0 is reused across write txns; drop txn-local
-			 * prefix scratch state so stale cache pointers from the
-			 * previous commit cannot leak into the next txn.
+			/* env->me_txn0 is reused across write txns; invalidate
+			 * txn-local prefix cache metadata while keeping scratch
+			 * allocations to amortize future insert/update cost.
 			 */
-			mdb_prefix_scratch_clear(&txn->mt_prefix);
+			mdb_prefix_scratch_reset(&txn->mt_prefix);
 			mode = 0;	/* txn == env->me_txn0, do not free() it */
 
 			/* The writer mutex was locked in mdb_txn_begin. */

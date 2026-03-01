@@ -3925,6 +3925,81 @@ test_nested_txn_rollback(void)
 	cleanup_env_dir(dir);
 }
 
+static void
+test_prefix_raw_header_guard_regression(void)
+{
+	static const char *dir = "testdb_prefix_raw_header_guard";
+	MDB_env *env = create_env_with_mapsize(dir, 512UL * 1024 * 1024);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	enum { KEY_COUNT = 8, VALUE_SIZE = 8168, ROUNDS = 64 };
+	static const unsigned char key2[] = {0xFA, 0x61};
+	static const unsigned char key3[] = {0xFA, 0x61, 0x6D};
+	static const unsigned char key4[] = {0xFA, 0x61, 0x6D, 0x65};
+	static const unsigned char key5[] = {0xFA, 0x61, 0x6D, 0x65, 0x72};
+	static const unsigned char key6[] = {0xFA, 0x61, 0x6D, 0x65, 0x72, 0x69};
+	static const unsigned char key7[] = {0xFA, 0x61, 0x6D, 0x65, 0x72, 0x69, 0x63};
+	static const unsigned char key8[] = {0xFA, 0x61, 0x6D, 0x65, 0x72, 0x69, 0x63, 0x61};
+	static const unsigned char key9[] = {0xFA, 0x61, 0x6D, 0x65, 0x72, 0x69, 0x63, 0x61, 0x6E};
+	static const MDB_val expected[KEY_COUNT] = {
+		{2, (void *)key2}, {3, (void *)key3}, {4, (void *)key4}, {5, (void *)key5},
+		{6, (void *)key6}, {7, (void *)key7}, {8, (void *)key8}, {9, (void *)key9}
+	};
+	unsigned char value_buf[VALUE_SIZE];
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED,
+	    &dbi));
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	for (unsigned int round = 1; round <= ROUNDS; ++round) {
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		for (size_t i = 0; i < VALUE_SIZE; ++i)
+			value_buf[i] = (unsigned char)((i + round * 7U) & 0xffU);
+		MDB_val value = { VALUE_SIZE, value_buf };
+		for (size_t i = 0; i < KEY_COUNT; ++i) {
+			MDB_val put_key = expected[i];
+			CHECK_CALL(mdb_put(txn, dbi, &put_key, &value, 0));
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+		MDB_cursor *cur = NULL;
+		CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+		MDB_val key = {0, NULL};
+		MDB_val data = {0, NULL};
+		int rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+		size_t seen = 0;
+		while (rc == MDB_SUCCESS) {
+			if (seen >= KEY_COUNT ||
+			    key.mv_size != expected[seen].mv_size ||
+			    memcmp(key.mv_data, expected[seen].mv_data, key.mv_size) != 0) {
+				fprintf(stderr,
+				    "raw header guard: unexpected key after round %u at index %zu\n",
+				    round, seen);
+				exit(EXIT_FAILURE);
+			}
+			seen++;
+			rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+		}
+		if (rc != MDB_NOTFOUND)
+			CHECK(rc, "mdb_cursor_get");
+		if (seen != KEY_COUNT) {
+			fprintf(stderr,
+			    "raw header guard: expected %d keys after round %u saw %zu\n",
+			    KEY_COUNT, round, seen);
+			exit(EXIT_FAILURE);
+		}
+		mdb_cursor_close(cur);
+		mdb_txn_abort(txn);
+	}
+
+	mdb_dbi_close(env, dbi);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+
 int
 main(void)
 {
@@ -3958,6 +4033,7 @@ main(void)
 	test_prefix_dupsort_fuzz();
 	test_prefix_concurrent_reads();
 	test_nested_txn_rollback();
+	test_prefix_raw_header_guard_regression();
 	test_prefix_fuzz();
 	printf("mtest_prefix: all tests passed\n");
 	return 0;

@@ -7062,6 +7062,11 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 			env->me_pglast = 0;
 
 			env->me_txn = NULL;
+			/* env->me_txn0 is reused across write txns; drop txn-local
+			 * prefix scratch state so stale cache pointers from the
+			 * previous commit cannot leak into the next txn.
+			 */
+			mdb_prefix_scratch_clear(&txn->mt_prefix);
 			mode = 0;	/* txn == env->me_txn0, do not free() it */
 
 			/* The writer mutex was locked in mdb_txn_begin. */

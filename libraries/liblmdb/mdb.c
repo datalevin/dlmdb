@@ -7541,7 +7541,7 @@ mdb_page_flush(MDB_txn *txn, int keep)
 #ifdef _WIN32
 		/* In windows, we still do writes to the file (with write-through enabled in sync mode),
 		 * as this is faster than FlushViewOfFile/FlushFileBuffers */
-		&& (env->me_flags & MDB_NOSYNC)
+		&& ((env->me_flags & MDB_NOSYNC) || (env->me_flags & MDB_INMEMORY))
 #endif
 		) {
 		/* Clear dirty flags */
@@ -8177,6 +8177,20 @@ mdb_env_write_meta(MDB_txn *txn)
 	if (mapsize < env->me_mapsize)
 		mapsize = env->me_mapsize;
 
+	if (flags & MDB_INMEMORY) {
+		mp->mm_mapsize = mapsize;
+		mp->mm_dbs[FREE_DBI] = txn->mt_dbs[FREE_DBI];
+		mp->mm_dbs[MAIN_DBI] = txn->mt_dbs[MAIN_DBI];
+		mp->mm_last_pg = txn->mt_next_pgno - 1;
+#if (__GNUC__ * 100 + __GNUC_MINOR__ >= 404) && /* TODO: portability */	\
+	!(defined(__i386__) || defined(__x86_64__))
+		/* LY: issue a memory barrier, if not x86. ITS#7969 */
+		__sync_synchronize();
+#endif
+		mp->mm_txnid = txn->mt_txnid;
+		goto done;
+	}
+
 #ifndef _WIN32 /* We don't want to ever use MSYNC/FlushViewOfFile in Windows */
 	if (flags & MDB_WRITEMAP) {
 		mp->mm_mapsize = mapsize;
@@ -8343,47 +8357,63 @@ mdb_env_map(MDB_env *env, void *addr)
 	SIZE_T msize;
 	ULONG pageprot = PAGE_READONLY, secprot, alloctype;
 
-	if (flags & MDB_WRITEMAP) {
-		access |= SECTION_MAP_WRITE;
-		pageprot = PAGE_READWRITE;
-	}
-	if (flags & MDB_RDONLY) {
-		secprot = PAGE_READONLY;
-		msize = 0;
-		alloctype = 0;
+	if (flags & MDB_INMEMORY) {
+		DWORD mlo, mhi;
+		if (flags & MDB_RDONLY)
+			return EINVAL;
+		mlo = (DWORD)(env->me_mapsize & 0xffffffff);
+		mhi = (DWORD)(env->me_mapsize >> 16 >> 16);
+		mh = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+			mhi, mlo, NULL);
+		if (!mh)
+			return ErrCode();
+		map = MapViewOfFileEx(mh, FILE_MAP_WRITE, 0, 0, env->me_mapsize, addr);
+		CloseHandle(mh);
+		if (!map)
+			return ErrCode();
 	} else {
-		secprot = PAGE_READWRITE;
-		msize = env->me_mapsize;
-		alloctype = MEM_RESERVE;
-	}
+		if (flags & MDB_WRITEMAP) {
+			access |= SECTION_MAP_WRITE;
+			pageprot = PAGE_READWRITE;
+		}
+		if (flags & MDB_RDONLY) {
+			secprot = PAGE_READONLY;
+			msize = 0;
+			alloctype = 0;
+		} else {
+			secprot = PAGE_READWRITE;
+			msize = env->me_mapsize;
+			alloctype = MEM_RESERVE;
+		}
 
-	/** Some users are afraid of seeing their disk space getting used
-	 * all at once, so the default is now to do incremental file growth.
-	 * But that has a large performance impact, so give the option of
-	 * allocating the file up front.
-	 */
+		/** Some users are afraid of seeing their disk space getting used
+		 * all at once, so the default is now to do incremental file growth.
+		 * But that has a large performance impact, so give the option of
+		 * allocating the file up front.
+		 */
 #ifdef MDB_FIXEDSIZE
-	LARGE_INTEGER fsize;
-	fsize.LowPart = msize & 0xffffffff;
-	fsize.HighPart = msize >> 16 >> 16;
-	rc = NtCreateSection(&mh, access, NULL, &fsize, secprot, SEC_RESERVE, env->me_fd);
+		LARGE_INTEGER fsize;
+		fsize.LowPart = msize & 0xffffffff;
+		fsize.HighPart = msize >> 16 >> 16;
+		rc = NtCreateSection(&mh, access, NULL, &fsize, secprot, SEC_RESERVE, env->me_fd);
 #else
-	rc = NtCreateSection(&mh, access, NULL, NULL, secprot, SEC_RESERVE, env->me_fd);
+		rc = NtCreateSection(&mh, access, NULL, NULL, secprot, SEC_RESERVE, env->me_fd);
 #endif
-	if (rc)
-		return mdb_nt2win32(rc);
-	map = addr;
+		if (rc)
+			return mdb_nt2win32(rc);
+		map = addr;
 #ifdef MDB_VL32
-	msize = NUM_METAS * env->me_psize;
+		msize = NUM_METAS * env->me_psize;
 #endif
-	rc = NtMapViewOfSection(mh, GetCurrentProcess(), &map, 0, 0, NULL, &msize, ViewUnmap, alloctype, pageprot);
+		rc = NtMapViewOfSection(mh, GetCurrentProcess(), &map, 0, 0, NULL, &msize, ViewUnmap, alloctype, pageprot);
 #ifdef MDB_VL32
-	env->me_fmh = mh;
+		env->me_fmh = mh;
 #else
-	NtClose(mh);
+		NtClose(mh);
 #endif
-	if (rc)
-		return mdb_nt2win32(rc);
+		if (rc)
+			return mdb_nt2win32(rc);
+	}
 	env->me_map = map;
 #else
 	int mmap_flags = MAP_SHARED;
@@ -8875,7 +8905,7 @@ mdb_env_open2(MDB_env *env, int prev)
 	}
 #ifdef _WIN32
 	/* For FIXEDMAP, make sure the file is non-empty before we attempt to map it */
-	if (newenv) {
+	if (newenv && !(flags & MDB_INMEMORY)) {
 		char dummy = 0;
 		DWORD len;
 		rc = WriteFile(env->me_fd, &dummy, 1, &len, NULL);
@@ -9008,10 +9038,6 @@ PIMAGE_TLS_CALLBACK mdb_tls_cbp = mdb_tls_callback;
 static int ESECT
 mdb_env_setup_inmem_locks(MDB_env *env)
 {
-#ifdef _WIN32
-	(void)env;
-	return ENOSYS;
-#else
 	int rc;
 	MDB_OFF_T rsize;
 
@@ -9020,8 +9046,29 @@ mdb_env_setup_inmem_locks(MDB_env *env)
 		if (rc)
 			return rc;
 		env->me_flags |= MDB_ENV_TXKEY;
+#ifdef _WIN32
+		/* Windows TLS callbacks need help finding their TLS info. */
+		if (mdb_tls_nkeys >= MAX_TLS_KEYS)
+			return MDB_TLS_FULL;
+		mdb_tls_keys[mdb_tls_nkeys++] = env->me_txkey;
+#endif
 	}
 
+#ifdef _WIN32
+	rsize = (env->me_maxreaders-1) * sizeof(MDB_reader) + sizeof(MDB_txninfo);
+	{
+		DWORD rlo = (DWORD)(rsize & 0xffffffff);
+		DWORD rhi = (DWORD)(rsize >> 16 >> 16);
+		HANDLE mh = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+			rhi, rlo, NULL);
+		if (!mh)
+			return ErrCode();
+		env->me_txns = MapViewOfFileEx(mh, FILE_MAP_WRITE, 0, 0, rsize, NULL);
+		CloseHandle(mh);
+		if (!env->me_txns)
+			return ErrCode();
+	}
+#else
 #ifdef MDB_MAP_ANON
 	rsize = (env->me_maxreaders-1) * sizeof(MDB_reader) + sizeof(MDB_txninfo);
 	env->me_txns = mmap(NULL, rsize, PROT_READ|PROT_WRITE,
@@ -9033,10 +9080,18 @@ mdb_env_setup_inmem_locks(MDB_env *env)
 #else
 	return ENOSYS;
 #endif
+#endif
 	env->me_flags |= MDB_ENV_INMEM_LOCKS;
 	memset(env->me_txns, 0, rsize);
 
-#ifdef MDB_USE_POSIX_SEM
+#ifdef _WIN32
+	env->me_rmutex = CreateMutex(NULL, FALSE, NULL);
+	if (!env->me_rmutex)
+		return ErrCode();
+	env->me_wmutex = CreateMutex(NULL, FALSE, NULL);
+	if (!env->me_wmutex)
+		return ErrCode();
+#elif defined(MDB_USE_POSIX_SEM)
 	{
 		static unsigned long mdb_inmem_semseq;
 		unsigned long seq = ++mdb_inmem_semseq;
@@ -9105,9 +9160,9 @@ mdb_env_setup_inmem_locks(MDB_env *env)
 	env->me_txns->mti_txnid = 0;
 	env->me_txns->mti_numreaders = 0;
 	env->me_live_reader = 1;
+	env->me_close_readers = env->me_maxreaders;
 
 	return MDB_SUCCESS;
-#endif
 }
 
 /** Downgrade the exclusive lock on the region back to shared */
@@ -9569,14 +9624,13 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	flags |= env->me_flags;
 
 	if (flags & MDB_INMEMORY) {
-#ifdef _WIN32
+#ifdef MDB_VL32
 		return ENOSYS;
-#else
+#endif
 		trace_path = ":memory:";
 		if (flags & (MDB_RDONLY|MDB_FIXEDMAP|MDB_PREVSNAPSHOT))
 			return EINVAL;
 		flags |= MDB_WRITEMAP|MDB_NOSYNC|MDB_NOMETASYNC;
-#endif
 	} else {
 		if (!path)
 			return EINVAL;

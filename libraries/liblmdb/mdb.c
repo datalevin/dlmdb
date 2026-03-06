@@ -17284,7 +17284,21 @@ mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 		mdb_cursor_init(&mc, txn, dbi, NULL);
 
 	rc = mdb_cursor_get_rank(&mc, rank, key, data, 0);
+	if (rc == MDB_SUCCESS && key &&
+	    (txn->mt_dbs[dbi].md_flags & MDB_PREFIX_COMPRESSION)) {
+		/* Prefix-decoded keys may point into cursor-local scratch. */
+		unsigned char *stable_key = NULL;
+		int krc = mdb_prefix_ensure_keybuf(txn, key->mv_size, &stable_key);
+		if (krc == MDB_SUCCESS) {
+			if (key->mv_size)
+				memcpy(stable_key, key->mv_data, key->mv_size);
+			key->mv_data = stable_key;
+		} else {
+			rc = krc;
+		}
+	}
 	MDB_CURSOR_UNREF(&mc, 1);
+	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
 	return rc;
 }
 

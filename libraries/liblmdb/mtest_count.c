@@ -540,6 +540,34 @@ expect_val_match(const MDB_val *got, const MDB_val *want, const char *msg)
 }
 
 static void
+expect_val_bytes(const MDB_val *got, const void *want_data, size_t want_size,
+                 const char *msg)
+{
+    if (got->mv_size != want_size ||
+        memcmp(got->mv_data, want_data, want_size) != 0) {
+        char *got_hex = dup_bytes_to_hex((const unsigned char *)got->mv_data,
+                                         got->mv_size);
+        char *want_hex = dup_bytes_to_hex((const unsigned char *)want_data,
+                                          want_size);
+        fprintf(stderr,
+                "%s: mismatch expected len=%zu %s got len=%zu %s\n",
+                msg, want_size, want_hex, (size_t)got->mv_size, got_hex);
+        free(got_hex);
+        free(want_hex);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void __attribute__((noinline))
+clobber_stack_after_rank(void)
+{
+    volatile unsigned char scratch[4096];
+
+    for (size_t i = 0; i < sizeof(scratch); ++i)
+        scratch[i] = (unsigned char)(i * 33u + 17u);
+}
+
+static void
 check_range_matches(MDB_txn *txn, MDB_dbi dbi,
                     const MDB_val *low, const MDB_val *high,
                     unsigned int flags, const char *msg)
@@ -2126,6 +2154,86 @@ test_rank_sampling_plain_stride(MDB_env *env)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank stride drop begin");
     CHECK(mdb_drop(txn, dbi, 1), "rank stride drop");
     CHECK(mdb_txn_commit(txn), "rank stride drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_random_access_plain_binary_prefix(MDB_env *env)
+{
+    static const char *const key_hexes[] = {
+        "FA61",
+        "FA62",
+        "FA63",
+    };
+    static const char *const val_hexes[] = {
+        "FA616C706861",
+        "FA62657461",
+        "FA67616D6D61",
+    };
+    enum { count = 3 };
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_cursor *cur;
+    MDB_val keys[count];
+    MDB_val vals[count];
+    unsigned char keybufs[count][8];
+    unsigned char valbufs[count][16];
+
+    for (int i = 0; i < count; ++i) {
+        keys[i].mv_size = hex_to_bytes(key_hexes[i], keybufs[i],
+                                       sizeof(keybufs[i]));
+        keys[i].mv_data = keybufs[i];
+        vals[i].mv_size = hex_to_bytes(val_hexes[i], valbufs[i],
+                                       sizeof(valbufs[i]));
+        vals[i].mv_data = valbufs[i];
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank binary begin");
+    CHECK(mdb_dbi_open(txn, "rank_plain_binary",
+                       MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
+                       &dbi),
+          "rank binary open");
+
+    for (int i = 0; i < count; ++i)
+        CHECK(mdb_put(txn, dbi, &keys[i], &vals[i], MDB_APPEND),
+              "rank binary put");
+
+    CHECK(mdb_txn_commit(txn), "rank binary commit");
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "rank binary rd");
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "rank binary cursor");
+
+    for (uint64_t idx = 0; idx < (uint64_t)count; ++idx) {
+        MDB_val got_key, got_data;
+        MDB_val api_key, api_data;
+        uint64_t key_rank = UINT64_MAX;
+
+        CHECK(mdb_cursor_get_rank(cur, idx, &got_key, &got_data, 0),
+              "rank binary cursor get");
+        expect_val_bytes(&got_key, keybufs[idx], keys[idx].mv_size,
+                         "rank binary cursor key");
+        expect_val_bytes(&got_data, valbufs[idx], vals[idx].mv_size,
+                         "rank binary cursor data");
+
+        CHECK(mdb_get_rank(txn, dbi, idx, &api_key, &api_data),
+              "rank binary api");
+        clobber_stack_after_rank();
+        expect_val_bytes(&api_key, keybufs[idx], keys[idx].mv_size,
+                         "rank binary api key");
+        expect_val_bytes(&api_data, valbufs[idx], vals[idx].mv_size,
+                         "rank binary api data");
+
+        CHECK(mdb_get_key_rank(txn, dbi, &keys[idx], NULL, &key_rank),
+              "rank binary key rank");
+        expect_eq(key_rank, idx, "rank binary key rank value");
+    }
+
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank binary drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "rank binary drop");
+    CHECK(mdb_txn_commit(txn), "rank binary drop commit");
     mdb_dbi_close(env, dbi);
 }
 
@@ -3992,6 +4100,7 @@ main(void)
     test_count_all_dupsort(env);
     test_count_all_persistence();
     test_random_access_plain(env);
+    test_random_access_plain_binary_prefix(env);
     test_rank_sampling_plain_stride(env);
     test_random_access_dupsort(env);
     test_overwrite_stability(env);

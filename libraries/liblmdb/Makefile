@@ -44,7 +44,7 @@ ILIBS	= $(LIBS) $(SHLIBS)
 LINKLIBS	= $(LIBS)
 IPROGS	= dlmdb_stat dlmdb_copy dlmdb_dump dlmdb_load dlmdb_drop
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_inmem count_bench compress_bench sample_bench dup_iter_bench inmem_bench
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_inmem count_bench compress_bench sample_bench dup_iter_bench inmem_bench startup_bench
 
 all:	$(ILIBS) $(PROGS)
 
@@ -99,6 +99,7 @@ compress_bench:	compress_bench.o $(LINKLIBS)
 sample_bench:	sample_bench.o $(LINKLIBS)
 dup_iter_bench:	dup_iter_bench.o $(LINKLIBS)
 inmem_bench:	inmem_bench.o $(LINKLIBS)
+startup_bench:	startup_bench.o $(LINKLIBS)
 mtest6:	mtest6.o $(LINKLIBS)
 mplay:	mplay.o $(LINKLIBS)
 

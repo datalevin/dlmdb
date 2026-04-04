@@ -319,6 +319,51 @@ compressed performance is generally slightly better than the uncompressed cases
 in DUPSORT workloads. As Datalevin's triple storage uses this format, we did
 more optimizations.
 
+## Startup Benchmark
+
+`startup_bench` measures isolated database reopen cost across four variants:
+plain, counted, prefix-compressed, and counted+prefix-compressed. Each run
+builds comparable databases, then times:
+
+* `startup_only` = `mdb_env_open` + `mdb_txn_begin` + `mdb_dbi_open`
+* `startup_with_probe` = `startup_only` + first `mdb_get`
+
+Example runs:
+
+```
+cd libraries/liblmdb
+make startup_bench
+./startup_bench -n 2000000 -r 30 -w 5
+./startup_bench -n 2000000 -r 100 -w 10 -N
+```
+
+Observed results on a local workstation with 2,000,000 entries and 64-byte
+values:
+
+```
+default locking
+  plain           startup_only=0.056 ms   startup_with_probe=0.061 ms
+  counted         startup_only=0.054 ms   startup_with_probe=0.059 ms
+  prefix          startup_only=0.055 ms   startup_with_probe=0.059 ms
+  counted+prefix  startup_only=0.063 ms   startup_with_probe=0.068 ms
+
+MDB_NOLOCK
+  plain           startup_only=0.036 ms   startup_with_probe=0.041 ms
+  counted         startup_only=0.039 ms   startup_with_probe=0.045 ms
+  prefix          startup_only=0.034 ms   startup_with_probe=0.038 ms
+  counted+prefix  startup_only=0.034 ms   startup_with_probe=0.039 ms
+```
+
+In this harness, neither `MDB_COUNTED` nor `MDB_PREFIX_COMPRESSION` adds
+meaningful startup overhead. The measured differences are only a few
+microseconds and are dominated by constant reopen costs. Prefix compression
+does, however, reduce the data file size substantially, which can help other
+workloads.
+
+This benchmark is intentionally narrow: it measures LMDB reopen cost, not full
+application startup. If an application still shows slower startup, the next
+step is to benchmark its actual open pattern, DBI count, and first-query path.
+
 ## Dupsort Bulk Iteration
 
 Most Datalevin Datalog query workloads first seek to a key and then read every

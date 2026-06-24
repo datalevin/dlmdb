@@ -15322,6 +15322,7 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 			}
 			copy->mp_pgno  = mp->mp_pgno;
 			copy->mp_flags = mp->mp_flags;
+			copy->mp_pad   = 0;
 			copy->mp_lower = (PAGEHDRSZ-PAGEBASE);
 			copy->mp_upper = env->me_psize - PAGEBASE;
 
@@ -15622,10 +15623,13 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		} while (i != split_indx);
 
 		nkeys = NUMKEYS(copy);
-		for (i=0; i<nkeys; i++)
+		for (i=0; i<nkeys; i++) {
 			mp->mp_ptrs[i] = copy->mp_ptrs[i];
+		}
 		mp->mp_lower = copy->mp_lower;
 		mp->mp_upper = copy->mp_upper;
+		if (IS_LEAF(mp))
+			mp->mp_pad = copy->mp_pad;
 		memcpy(NODEPTR(mp, nkeys-1), NODEPTR(copy, nkeys-1),
 			env->me_psize - copy->mp_upper - PAGEBASE);
 

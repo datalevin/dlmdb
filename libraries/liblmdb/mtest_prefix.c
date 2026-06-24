@@ -95,6 +95,7 @@ pf_trace_ops(void)
 }
 
 static void test_prefix_leaf_splits(void);
+static void test_prefix_split_stride_reverse_regression(void);
 static void test_prefix_split_trunk_reencode_regression(void);
 static void test_prefix_alternating_prefixes(void);
 static void test_prefix_update_reinsert(void);
@@ -1653,6 +1654,178 @@ test_prefix_leaf_splits(void)
 		fprintf(stderr, "leaf splits: expected %zu entries, saw %zu\n", total, seen);
 		exit(EXIT_FAILURE);
 	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+
+#define PSS_N_SHORT 27
+#define PSS_N_LONG  83
+#define PSS_N_TOTAL (PSS_N_SHORT + PSS_N_LONG)
+#define PSS_MAX_KEY 512
+
+static const int pss_large_sizes[PSS_N_LONG] = {
+	496,415,424,287,276,333,320,288,320,320,275,288,348,348,380,384,348,355,393,
+	348,438,400,390,388,427,430,275,298,306,275,315,384,384,384,273,273,274,273,
+	387,366,273,419,419,392,349,273,414,368,349,288,289,321,478,474,502,388,482,
+	289,314,386,308,307,365,334,347,354,355,314,359,359,382,446,385,307,307,398,
+	355,454,338,303,308,302,329
+};
+
+typedef struct {
+	int is_long;
+	int idx;
+} PSSDesc;
+
+static uint64_t pss_seed;
+
+static void
+pss_random_init(int64_t seed)
+{
+	pss_seed = ((uint64_t)seed ^ UINT64_C(0x5DEECE66D)) &
+	    ((UINT64_C(1) << 48) - 1);
+}
+
+static int32_t
+pss_random_next(int bits)
+{
+	pss_seed = (pss_seed * UINT64_C(0x5DEECE66D) + UINT64_C(0xB)) &
+	    ((UINT64_C(1) << 48) - 1);
+	return (int32_t)(pss_seed >> (48 - bits));
+}
+
+static int
+pss_random_next_int(int bound)
+{
+	if ((bound & -bound) == bound)
+		return (int)(((int64_t)bound * (int64_t)pss_random_next(31)) >> 31);
+
+	int bits, val;
+	do {
+		bits = pss_random_next(31);
+		val = bits % bound;
+	} while (bits - val + (bound - 1) < 0);
+	return val;
+}
+
+static void
+pss_build_key(const PSSDesc *desc, unsigned char *out, int *len)
+{
+	if (desc->is_long) {
+		int size = pss_large_sizes[desc->idx];
+		memset(out, 0x42, (size_t)size);
+		out[0] = 0x10;
+		out[1] = 0x00;
+		out[2] = (unsigned char)(3 * desc->idx);
+		*len = size;
+	} else {
+		memset(out, 0x05, 6);
+		out[5] = (unsigned char)desc->idx;
+		*len = 6;
+	}
+}
+
+static void
+pss_generate_keys(unsigned char keybuf[PSS_N_TOTAL][PSS_MAX_KEY],
+    int keylen[PSS_N_TOTAL])
+{
+	PSSDesc descs[PSS_N_TOTAL];
+
+	for (int i = 0; i < PSS_N_SHORT; ++i) {
+		descs[i].is_long = 0;
+		descs[i].idx = i;
+	}
+	for (int i = 0; i < PSS_N_LONG; ++i) {
+		descs[PSS_N_SHORT + i].is_long = 1;
+		descs[PSS_N_SHORT + i].idx = i;
+	}
+
+	pss_random_init(26);
+	for (int i = PSS_N_TOTAL; i > 1; --i) {
+		int j = pss_random_next_int(i);
+		PSSDesc tmp = descs[i - 1];
+		descs[i - 1] = descs[j];
+		descs[j] = tmp;
+	}
+
+	for (int i = 0; i < PSS_N_TOTAL; ++i)
+		pss_build_key(&descs[i], keybuf[i], &keylen[i]);
+}
+
+static void
+test_prefix_split_stride_reverse_regression(void)
+{
+	static const char *dir = "testdb_prefix_split_stride_reverse";
+	static const char *db_name = "split-stride";
+	unsigned char keybuf[PSS_N_TOTAL][PSS_MAX_KEY];
+	int keylen[PSS_N_TOTAL];
+	MDB_env *env = create_env_with_mapsize(dir, 256UL * 1024 * 1024);
+	MDB_txn *txn = NULL;
+	MDB_dbi dbi;
+	MDB_cursor *cur = NULL;
+	MDB_val key = {0, NULL};
+	MDB_val data = {0, NULL};
+	MDB_stat st = {0};
+	int rc;
+
+	pss_generate_keys(keybuf, keylen);
+
+	for (int i = 0; i < PSS_N_TOTAL; ++i) {
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, db_name,
+		    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+		MDB_val k = {(size_t)keylen[i], keybuf[i]};
+		MDB_val v = {sizeof(i), &i};
+		CHECK_CALL(mdb_put(txn, dbi, &k, &v, 0));
+		CHECK_CALL(mdb_txn_commit(txn));
+	}
+
+	mdb_env_close(env);
+	env = NULL;
+	CHECK_CALL(mdb_env_create(&env));
+	CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+	CHECK_CALL(mdb_env_set_mapsize(env, 256UL * 1024 * 1024));
+	CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+	CHECK_CALL(mdb_stat(txn, dbi, &st));
+	if (st.ms_depth < 2 || st.ms_entries != PSS_N_TOTAL) {
+		fprintf(stderr,
+		    "split stride regression: expected multi-page %d-entry db, depth=%u entries=%zu\n",
+		    PSS_N_TOTAL, st.ms_depth, (size_t)st.ms_entries);
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	size_t seen = 0;
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	while (rc == MDB_SUCCESS) {
+		seen++;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT_NODUP);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "split stride forward walk");
+	if (seen != PSS_N_TOTAL) {
+		fprintf(stderr, "split stride regression: forward saw %zu entries\n", seen);
+		exit(EXIT_FAILURE);
+	}
+
+	seen = 0;
+	rc = mdb_cursor_get(cur, &key, &data, MDB_LAST);
+	while (rc == MDB_SUCCESS) {
+		seen++;
+		rc = mdb_cursor_get(cur, &key, &data, MDB_PREV_NODUP);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "split stride reverse walk");
+	if (seen != PSS_N_TOTAL) {
+		fprintf(stderr, "split stride regression: reverse saw %zu entries\n", seen);
+		exit(EXIT_FAILURE);
+	}
+
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
@@ -4018,6 +4191,7 @@ main(void)
 	test_prefix_encoded_range_regression();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
+	test_prefix_split_stride_reverse_regression();
 	test_prefix_split_trunk_reencode_regression();
 	test_prefix_alternating_prefixes();
 	test_prefix_update_reinsert();

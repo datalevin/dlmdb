@@ -10701,8 +10701,8 @@ mdb_page_search_root(MDB_cursor *mc, MDB_val *key, int flags)
 		mdb_cassert(mc, i < NUMKEYS(mp));
 		node = NODEPTR(mp, i);
 
-	if ((rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL)) != 0)
-		return rc;
+		if ((rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL)) != 0)
+			return rc;
 
 		mc->mc_ki[mc->mc_top] = i;
 		if ((rc = mdb_cursor_push(mc, mp)))
@@ -14239,19 +14239,19 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 		MDB_node *s2;
 		MDB_val bkey;
 		/* must find the lowest key below dst */
-	mdb_cursor_copy(cdst, &mn);
-	rc = mdb_page_search_lowest(&mn);
-	if (rc)
-		return rc;
+		mdb_cursor_copy(cdst, &mn);
+		rc = mdb_page_search_lowest(&mn);
+		if (rc)
+			return rc;
 		if (IS_LEAF2(mn.mc_pg[mn.mc_top])) {
 			bkey.mv_size = mn.mc_db->md_pad;
 			bkey.mv_data = LEAF2KEY(mn.mc_pg[mn.mc_top], 0, bkey.mv_size);
 		} else {
 			s2 = NODEPTR(mn.mc_pg[mn.mc_top], 0);
-		if (mn.mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
-			rc = mdb_cursor_read_key_at(&mn, mn.mc_pg[mn.mc_top], 0, &bkey);
-			if (rc != MDB_SUCCESS)
-				return rc;
+			if (mn.mc_db->md_flags & MDB_PREFIX_COMPRESSION) {
+				rc = mdb_cursor_read_key_at(&mn, mn.mc_pg[mn.mc_top], 0, &bkey);
+				if (rc != MDB_SUCCESS)
+					return rc;
 			} else {
 				bkey.mv_size = NODEKSZ(s2);
 				bkey.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
@@ -14260,9 +14260,9 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 		mn.mc_snum = snum--;
 		mn.mc_top = snum;
 		mn.mc_ki[snum] = 0;
-	rc = mdb_update_key(&mn, &bkey);
-	if (rc)
-		return rc;
+		rc = mdb_update_key(&mn, &bkey);
+		if (rc)
+			return rc;
 	}
 
 	DPRINTF(("moving %s node %u [%s] on page %"Yu" to node %u on page %"Yu,
@@ -17323,9 +17323,9 @@ mdb_stat(MDB_txn *txn, MDB_dbi dbi, MDB_stat *arg)
 	if (txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
 
-		if (txn->mt_dbflags[dbi] & DB_STALE) {
-			MDB_cursor mc = (MDB_cursor){0};
-			MDB_xcursor mx = (MDB_xcursor){0};
+	if (txn->mt_dbflags[dbi] & DB_STALE) {
+		MDB_cursor mc = (MDB_cursor){0};
+		MDB_xcursor mx = (MDB_xcursor){0};
 		/* Stale, must read the DB's root. cursor_init does it for us. */
 		mdb_cursor_init(&mc, txn, dbi, &mx);
 	}

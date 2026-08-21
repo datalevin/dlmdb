@@ -82,10 +82,15 @@ libdlmdb$(SOEXT):	mdb.lo midl.lo
 	$(CC) $(LDFLAGS) -pthread -shared -o $@ mdb.lo midl.lo $(SOLIBS)
 
 dlmdb_stat: mdb_stat.o $(LINKLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 dlmdb_copy: mdb_copy.o $(LINKLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 dlmdb_dump: mdb_dump.o $(LINKLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 dlmdb_load: mdb_load.o $(LINKLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 dlmdb_drop: mdb_drop.o $(LINKLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 mtest:  mtest.o $(LINKLIBS)
 mtest2:	mtest2.o $(LINKLIBS)
 mtest3:	mtest3.o $(LINKLIBS)

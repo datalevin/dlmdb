@@ -179,11 +179,7 @@ typedef SSIZE_T	ssize_t;
 # if !(defined(MDB_USE_POSIX_MUTEX) || defined(MDB_USE_POSIX_SEM))
 # define MDB_USE_SYSV_SEM	1
 # endif
-# if defined(__APPLE__)
-# define MDB_FDATASYNC(fd)		fcntl(fd, F_FULLFSYNC)
-# else
 # define MDB_FDATASYNC		fsync
-# endif
 #elif defined(__ANDROID__)
 # define MDB_FDATASYNC		fsync
 #elif defined(__HAIKU__)

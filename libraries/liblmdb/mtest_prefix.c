@@ -95,6 +95,7 @@ pf_trace_ops(void)
 }
 
 static void test_prefix_leaf_splits(void);
+static void test_prefix_overflow_trunk_reencode_regression(void);
 static void test_prefix_split_stride_reverse_regression(void);
 static void test_prefix_split_trunk_reencode_regression(void);
 static void test_prefix_alternating_prefixes(void);
@@ -1654,6 +1655,75 @@ test_prefix_leaf_splits(void)
 		fprintf(stderr, "leaf splits: expected %zu entries, saw %zu\n", total, seen);
 		exit(EXIT_FAILURE);
 	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+
+static void
+test_prefix_overflow_trunk_reencode_regression(void)
+{
+	static const char *dir = "testdb_prefix_overflow_trunk_reencode";
+	static const char *db_name = "overflow-trunk";
+	static const char *keys[] = {"document4", "document3", "alpha"};
+	static const char *expected[] = {"alpha", "document3", "document4"};
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn = NULL;
+	MDB_cursor *cur = NULL;
+	MDB_dbi dbi;
+	MDB_stat stat = {0};
+	unsigned char small[4] = {1, 1, 1, 1};
+	unsigned char *large;
+	size_t large_size;
+	int rc;
+
+	CHECK_CALL(mdb_env_stat(env, &stat));
+	large_size = (size_t)stat.ms_psize * 2;
+	large = malloc(large_size);
+	if (!large)
+		die_errno("malloc overflow trunk value");
+	memset(large, 2, large_size);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_CREATE | MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+	for (size_t i = 0; i < ARRAY_SIZE(keys); ++i) {
+		MDB_val key = {strlen(keys[i]), (void *)keys[i]};
+		MDB_val data = {i == 2 ? large_size : sizeof(small),
+		    i == 2 ? (void *)large : (void *)small};
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	free(large);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, db_name,
+	    MDB_PREFIX_COMPRESSION | MDB_COUNTED, &dbi));
+	MDB_val lookup = {strlen(keys[0]), (void *)keys[0]};
+	MDB_val data = {0, NULL};
+	CHECK_CALL(mdb_get(txn, dbi, &lookup, &data));
+	if (data.mv_size != sizeof(small) ||
+	    memcmp(data.mv_data, small, sizeof(small)) != 0) {
+		fprintf(stderr, "overflow trunk: exact lookup returned wrong value\n");
+		exit(EXIT_FAILURE);
+	}
+
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	MDB_val key = {0, NULL};
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	for (size_t i = 0; i < ARRAY_SIZE(expected); ++i) {
+		if (rc != MDB_SUCCESS || key.mv_size != strlen(expected[i]) ||
+		    memcmp(key.mv_data, expected[i], key.mv_size) != 0) {
+			fprintf(stderr,
+			    "overflow trunk: cursor mismatch at index %zu\n", i);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND)
+		CHECK(rc, "overflow trunk cursor end");
+
 	mdb_cursor_close(cur);
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
@@ -4191,6 +4261,7 @@ main(void)
 	test_prefix_encoded_range_regression();
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
+	test_prefix_overflow_trunk_reencode_regression();
 	test_prefix_split_stride_reverse_regression();
 	test_prefix_split_trunk_reencode_regression();
 	test_prefix_alternating_prefixes();

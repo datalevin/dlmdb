@@ -13171,7 +13171,8 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
 					return rc;
 				DPRINTF(("allocated overflow page %"Yu, ofp->mp_pgno));
 				flags |= F_BIGDATA;
-				goto update;
+				if (!need_reencode)
+					goto update;
 			}
 		} else {
 			node_size += data->mv_size;

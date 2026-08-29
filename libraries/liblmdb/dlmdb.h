@@ -1790,10 +1790,10 @@ int	mdb_reader_check(MDB_env *env, int *dead);
 #endif
 /** @page tools LMDB Command Line Tools
 	The following describes the command line tools that are available for LMDB.
-	\li \ref dlmdb_copy_1
-	\li \ref dlmdb_dump_1
-	\li \ref dlmdb_load_1
-	\li \ref dlmdb_stat_1
+	\li \ref mdb_copy_1
+	\li \ref mdb_dump_1
+	\li \ref mdb_load_1
+	\li \ref mdb_stat_1
 */
 
 #endif /* _DLMDB_H_ */

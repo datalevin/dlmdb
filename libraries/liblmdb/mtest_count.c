@@ -363,6 +363,38 @@ next_rand(unsigned int *state)
     return *state;
 }
 
+static uint32_t
+java_random_next(uint64_t *state, unsigned int bits)
+{
+    *state = (*state * UINT64_C(0x5DEECE66D) + UINT64_C(0xB)) &
+             UINT64_C(0xFFFFFFFFFFFF);
+    return (uint32_t)(*state >> (48 - bits));
+}
+
+static uint32_t
+java_random_next_int(uint64_t *state, uint32_t bound)
+{
+    if ((bound & (bound - 1)) == 0)
+        return (uint32_t)((bound *
+                           (uint64_t)java_random_next(state, 31)) >> 31);
+
+    uint32_t bits;
+    uint32_t value;
+    do {
+        bits = java_random_next(state, 31);
+        value = bits % bound;
+    } while ((int32_t)(bits - value + (bound - 1)) < 0);
+    return value;
+}
+
+static void
+encode_rank_key(uint64_t value, unsigned char out[9])
+{
+    out[0] = 1;
+    for (unsigned int i = 0; i < 8; ++i)
+        out[i + 1] = (unsigned char)(value >> (56 - 8 * i));
+}
+
 static uint64_t
 naive_count(MDB_txn *txn, MDB_dbi dbi,
             const MDB_val *low, const MDB_val *high,
@@ -2062,6 +2094,92 @@ test_random_access_plain(MDB_env *env)
     CHECK(mdb_drop(txn, counted_small, 1), "rank plain extra drop");
     CHECK(mdb_txn_commit(txn), "rank plain extra drop commit");
     mdb_dbi_close(env, counted_small);
+}
+
+static void
+test_random_insert_parent_split_rank(MDB_env *env)
+{
+    /* Match the Java shuffle and encoded keys from the Datalevin reproducer. */
+    const uint32_t count = 1000000;
+    uint32_t *order = malloc((size_t)count * sizeof(*order));
+    uint64_t random_state =
+        (UINT64_C(2026082707) ^ UINT64_C(0x5DEECE66D)) &
+        UINT64_C(0xFFFFFFFFFFFF);
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_cursor *cur;
+
+    if (!order) {
+        fprintf(stderr, "rank parent split: failed to allocate order\n");
+        exit(EXIT_FAILURE);
+    }
+    for (uint32_t i = 0; i < count; ++i)
+        order[i] = i;
+    for (uint32_t i = count; i > 1; --i) {
+        uint32_t j = java_random_next_int(&random_state, i);
+        uint32_t tmp = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = tmp;
+    }
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "rank parent split begin");
+    CHECK(mdb_dbi_open(txn, "rank_parent_split",
+                       MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION,
+                       &dbi),
+          "rank parent split open");
+    CHECK(mdb_txn_commit(txn), "rank parent split open commit");
+    for (uint32_t base = 0; base < count; base += 512) {
+        uint32_t limit = base + 512;
+        if (limit > count)
+            limit = count;
+        CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+              "rank parent split batch begin");
+        for (uint32_t i = base; i < limit; ++i) {
+            unsigned char keybuf[9];
+            unsigned char databuf[9];
+            encode_rank_key(order[i], keybuf);
+            encode_rank_key(order[i], databuf);
+            MDB_val key = {sizeof(keybuf), keybuf};
+            MDB_val data = {sizeof(databuf), databuf};
+            int rc = mdb_put(txn, dbi, &key, &data, 0);
+            if (rc != MDB_SUCCESS) {
+                fprintf(stderr,
+                        "rank parent split put failed at insertion %" PRIu32
+                        " key %" PRIu32 ": %s\n",
+                        i, order[i], mdb_strerror(rc));
+                exit(EXIT_FAILURE);
+            }
+        }
+        CHECK(mdb_txn_commit(txn), "rank parent split batch commit");
+    }
+    free(order);
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "rank parent split read");
+    CHECK(mdb_cursor_open(txn, dbi, &cur), "rank parent split cursor");
+    for (uint64_t rank = 0; rank < count; ++rank) {
+        MDB_val key;
+        MDB_val data;
+        unsigned char expected[9];
+        encode_rank_key(rank, expected);
+        CHECK(mdb_cursor_get_rank(cur, rank, &key, &data, 0),
+              "rank parent split get");
+        if (key.mv_size != sizeof(expected) ||
+            memcmp(key.mv_data, expected, sizeof(expected)) != 0) {
+            fprintf(stderr,
+                    "rank parent split mismatch at rank %" PRIu64 "\n",
+                    rank);
+            exit(EXIT_FAILURE);
+        }
+    }
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "rank parent split drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "rank parent split drop");
+    CHECK(mdb_txn_commit(txn), "rank parent split drop commit");
+    mdb_dbi_close(env, dbi);
 }
 
 static void
@@ -4083,6 +4201,8 @@ main(void)
 
     rc = mdb_env_create(&env);
     CHECK(rc, "mdb_env_create");
+    CHECK(mdb_env_set_mapsize(env, 256UL * 1024UL * 1024UL),
+          "mdb_env_set_mapsize");
     CHECK(mdb_env_set_maxdbs(env, 8), "mdb_env_set_maxdbs");
     CHECK(mdb_env_open(env, pathbuf, MDB_NOLOCK, 0664), "mdb_env_open");
 
@@ -4100,6 +4220,7 @@ main(void)
     test_count_all_dupsort(env);
     test_count_all_persistence();
     test_random_access_plain(env);
+    test_random_insert_parent_split_rank(env);
     test_random_access_plain_binary_prefix(env);
     test_rank_sampling_plain_stride(env);
     test_random_access_dupsort(env);

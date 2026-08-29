@@ -63,7 +63,7 @@ clean:
 
 test:	all
 	rm -rf testdb && mkdir testdb
-	./mtest && ./mdb_stat -L testdb
+	./mtest && ./dlmdb_stat -L testdb
 	./mtest2
 	./mtest3
 	./mtest4
@@ -86,6 +86,8 @@ dlmdb_copy: mdb_copy.o $(LINKLIBS)
 dlmdb_dump: mdb_dump.o $(LINKLIBS)
 dlmdb_load: mdb_load.o $(LINKLIBS)
 dlmdb_drop: mdb_drop.o $(LINKLIBS)
+$(IPROGS):
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 mtest:  mtest.o $(LINKLIBS)
 mtest2:	mtest2.o $(LINKLIBS)
 mtest3:	mtest3.o $(LINKLIBS)

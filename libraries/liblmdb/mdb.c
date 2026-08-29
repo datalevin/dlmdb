@@ -4977,17 +4977,18 @@ mdb_update_parent_count(MDB_page *parent, pgno_t child_pgno, uint64_t total)
 }
 
 static void
-mdb_propagate_count_delta(MDB_cursor *mc, int level, int64_t delta)
+mdb_propagate_count_delta_path(MDB_page *const *pages, const indx_t *indices,
+	int level, int64_t delta)
 {
 	if (!delta)
 		return;
 	for (int i = level; i >= 0; --i) {
-		MDB_page *parent = mc->mc_pg[i];
+		MDB_page *parent = pages[i];
 		if (!parent)
 			break;
 		if (!IS_BRANCH(parent) || !IS_COUNTED(parent))
 			continue;
-		indx_t idx = mc->mc_ki[i];
+		indx_t idx = indices[i];
 		if (idx >= NUMKEYS(parent))
 			continue;
 		MDB_node *node = NODEPTR(parent, idx);
@@ -4997,6 +4998,12 @@ mdb_propagate_count_delta(MDB_cursor *mc, int level, int64_t delta)
 			acc = 0;
 		mdb_node_set_count(parent, node, (uint64_t)acc);
 	}
+}
+
+static void
+mdb_propagate_count_delta(MDB_cursor *mc, int level, int64_t delta)
+{
+	mdb_propagate_count_delta_path(mc->mc_pg, mc->mc_ki, level, delta);
 }
 
 static void
@@ -15149,6 +15156,8 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	MDB_page	*mp, *rp, *pp;
 	int ptop;
 	MDB_cursor	mn;
+	MDB_page	*count_left_pg[CURSOR_STACK], *count_right_pg[CURSOR_STACK];
+	indx_t		 count_left_ki[CURSOR_STACK], count_right_ki[CURSOR_STACK];
 	MDB_prefix_rebuild_entry *prefix_split_entries = NULL;
 	unsigned int prefix_split_total = 0;
 	int prefix_split_ready = 0;
@@ -15156,6 +15165,7 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	uint64_t	pre_split_total = MDB_COUNT_HINT_NONE;
 	uint64_t	 left_tally = 0, right_tally = 0;
 	int		 have_left_tally = 0, have_right_tally = 0;
+	int		 have_count_paths = 0;
 	DKBUF;
 
 	mp = mc->mc_pg[mc->mc_top];
@@ -15478,6 +15488,15 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 				rc = MDB_PROBLEM;
 			goto done;
 		}
+		if (track_counts) {
+			for (i = 0; i <= ptop; ++i) {
+				count_left_pg[i] = mc->mc_pg[i];
+				count_left_ki[i] = mc->mc_ki[i];
+				count_right_pg[i] = mn.mc_pg[i];
+				count_right_ki[i] = mn.mc_ki[i];
+			}
+			have_count_paths = 1;
+		}
 		if (prefix_split_ready && did_split && !(nflags & MDB_APPEND) && !IS_LEAF2(mp)) {
 			rc = mdb_prefix_leaf_split_collect_entries(mc, mp, newindx,
 			    newkey, newdata, nflags,
@@ -15675,20 +15694,33 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 	}
 
 	{
-		if (track_counts && mc->mc_top > 0) {
-			MDB_page *parent = mc->mc_pg[ptop];
-			if (parent) {
+		if (track_counts && have_count_paths) {
+			MDB_page *left_parent = count_left_pg[ptop];
+			MDB_page *right_parent = count_right_pg[ptop];
+			if (left_parent && right_parent) {
 				uint64_t left_total = left_tally;
 				uint64_t right_total = right_tally;
 				if (!have_left_tally)
 					left_total = mdb_page_subtree_count(mp);
 				if (!have_right_tally)
 					right_total = mdb_page_subtree_count(rp);
-				int64_t delta_left = mdb_update_parent_count(parent, mp->mp_pgno, left_total);
-				int64_t delta_right = mdb_update_parent_count(parent, rp->mp_pgno, right_total);
-				int64_t delta = delta_left + delta_right;
-				if (delta)
-					mdb_propagate_count_delta(mc, ptop-1, delta);
+				int64_t delta_left = mdb_update_parent_count(
+				    left_parent, mp->mp_pgno, left_total);
+				int64_t delta_right = mdb_update_parent_count(
+				    right_parent, rp->mp_pgno, right_total);
+				if (left_parent == right_parent) {
+					int64_t delta = delta_left + delta_right;
+					if (delta)
+						mdb_propagate_count_delta_path(
+						    count_left_pg, count_left_ki, ptop-1, delta);
+				} else {
+					if (delta_left)
+						mdb_propagate_count_delta_path(
+						    count_left_pg, count_left_ki, ptop-1, delta_left);
+					if (delta_right)
+						mdb_propagate_count_delta_path(
+						    count_right_pg, count_right_ki, ptop-1, delta_right);
+				}
 			}
 		}
 

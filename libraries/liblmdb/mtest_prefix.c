@@ -2955,7 +2955,7 @@ test_prefix_dupsort_split_replace_combinations(void)
 	static const char *seed_b_str = "dup-inline-0600";
 	int observed_split = 0;
 
-	for (size_t base_count = 32; base_count <= 192; base_count += 4) {
+	for (size_t base_count = 0; base_count <= 192; base_count += 4) {
 		MDB_env *env = create_env(dir);
 		MDB_txn *txn = NULL;
 		MDB_dbi dbi;

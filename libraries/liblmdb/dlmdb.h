@@ -1656,7 +1656,8 @@ int  mdb_cursor_get(MDB_cursor *cursor, MDB_val *key, MDB_val *data,
 	 *		the size of a single data element. The mv_data of the first MDB_val
 	 *		must point to the beginning of the array of contiguous data elements.
 	 *		The mv_size of the second MDB_val must be the count of the number
-	 *		of data elements to store. On return this field will be set to
+	 *		of data elements to store and must not exceed UINT_MAX. On return
+	 *		this field will be set to
 	 *		the count of the number of elements actually written. The mv_data
 	 *		of the second MDB_val is unused.
 	 * </ul>
@@ -1714,10 +1715,10 @@ int  mdb_cursor_count(MDB_cursor *cursor, mdb_size_t *countp);
 	 * This call materializes every duplicate value for the key at the cursor's
 	 * current position and returns a pointer to an array of #MDB_val entries.
 	 * The returned array is owned by LMDB; it remains valid until the cursor is
-	 * moved to a different key or the transaction ends.  This accelerated path
-	 * is only available for #MDB_DUPSORT databases whose duplicate items are
-	 * stored inline on the containing leaf page (the normal case). Keys whose
-	 * duplicates were promoted to sub-databases return #MDB_INCOMPATIBLE.
+	 * moved to a different key or the transaction ends. #MDB_DUPFIXED duplicate
+	 * sub-databases are collected one LEAF2 page at a time without copying the
+	 * fixed-width values. Other #MDB_DUPSORT layouts, including prefix-compressed
+	 * duplicate sub-databases, are materialized in cursor-owned storage.
 	 * @param[in] cursor A cursor handle returned by #mdb_cursor_open()
 	 * @param[out] values On success, updated to point at \b countp read-only #MDB_val
 	 *	entries describing each duplicate value for the current key. The pointer
@@ -1727,8 +1728,7 @@ int  mdb_cursor_count(MDB_cursor *cursor, mdb_size_t *countp);
 	 * errors are:
 	 * <ul>
 	 *	<li>#MDB_NOTFOUND - the current key does not have duplicate data items.
-	 *	<li>#MDB_INCOMPATIBLE - the database does not support #MDB_DUPSORT or the
-	 *		key's duplicates are stored in a sub-database.
+	 *	<li>#MDB_INCOMPATIBLE - the database does not support #MDB_DUPSORT.
 	 *	<li>EINVAL - cursor is not initialized, or an invalid parameter was specified.
 	 * </ul>
 	 */

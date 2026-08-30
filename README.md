@@ -319,6 +319,79 @@ compressed performance is generally slightly better than the uncompressed cases
 in DUPSORT workloads. As Datalevin's triple storage uses this format, we did
 more optimizations.
 
+## DUPFIXED LEAF2 Benchmark
+
+`leaf2_bench` compares fixed-width LEAF2 duplicate pages with normal
+prefix-compressed duplicate trees. Both variants use `MDB_DUPSORT`,
+`MDB_COUNTED`, and `MDB_PREFIX_COMPRESSION`; the only database flag difference
+is `MDB_DUPFIXED`. They receive identical 16-byte keys, ordered 8-byte values,
+transaction batches, and scalar `MDB_APPENDDUP` calls.
+
+### LEAF2 read-side specialization
+
+`mdb_cursor_list_dup()` returns every duplicate for the cursor's current key.
+Inline LEAF2 duplicates already map directly to their containing page. When a
+larger `MDB_DUPFIXED` set has been promoted to a nested B-tree, the read path
+now preserves the nested cursor position and collects the tree page by page:
+
+1. Position the nested cursor at its first value and use `MDB_GET_MULTIPLE` to
+   obtain the complete current LEAF2 page.
+2. Build the returned `MDB_val` descriptors with fixed-width pointer arithmetic;
+   the duplicate bytes remain in their memory-mapped pages and are not copied.
+3. Use `MDB_NEXT_MULTIPLE` only after consuming a page, reducing cursor movement
+   from once per value to once per LEAF2 page.
+4. Validate each page's type, width, byte count, and final entry count, then
+   restore the caller's original duplicate position.
+
+The descriptor fill remains O(values), but B-tree traversal is O(pages). The
+same API and cursor-position contract apply whether the caller starts on the
+first, middle, or last duplicate. Normal prefix-compressed DUPSORT trees keep
+the existing scalar decode-and-copy path because their values are variable
+width and may use cursor-owned decode buffers.
+
+The benchmark uses independent fresh databases for append, interior insert, and
+exact-value delete workloads. It also measures validated scalar scans, random
+`MDB_GET_BOTH` lookups, `mdb_cursor_list_dup` scans, LEAF2 `MDB_GET_MULTIPLE`
+scans, and a supplemental `MDB_MULTIPLE` write ceiling. Setup and full
+validation are outside the mutation timers. Fresh A/B order alternates between
+rounds, and reported speedups are the median of the per-round prefix time
+divided by LEAF2 time.
+
+Build and run the default workload with:
+
+```
+make -C libraries/liblmdb leaf2_bench
+cd libraries/liblmdb
+./leaf2_bench
+```
+
+The default workload uses 256 keys with 4096 duplicates each (1,048,576 total
+values), four fresh A/B rounds, three repeated read passes, 100,000 exact
+lookups, 65,536-value transactions, a 1 GiB map, and
+`MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOLOCK`. The OS page cache is not purged.
+
+Representative results measured on 2026-08-29 on a MacBook Pro with an Apple
+M3 Pro (12 cores, 36 GB RAM), macOS 26.6.2, 16 KiB pages, and Apple clang
+21.0.0 using the Makefile's `-O2 -g` flags:
+
+| Operation | Prefix DUPSORT | DUPFIXED LEAF2 | Paired result |
+| --- | ---: | ---: | ---: |
+| Scalar append cursor puts | 161.947 ms | 74.821 ms | 2.174x speedup |
+| Interior cursor inserts | 389.317 ms | 227.374 ms | 1.723x speedup |
+| Exact-value `mdb_del` | 1582.207 ms | 372.374 ms | 4.254x speedup |
+| Repeated scalar scan | 16.343 ms | 9.727 ms | 1.699x speedup |
+| Repeated `mdb_cursor_list_dup` | 11.855 ms | 0.679 ms | 17.453x speedup |
+| Random `MDB_GET_BOTH` | 102.626 ms | 34.108 ms | 2.957x speedup |
+| Append high-water footprint | 20.23 bytes/value | 16.23 bytes/value | 0.802x size |
+
+The LEAF2 `MDB_GET_MULTIPLE` scan consumed all values in 768 chunks in
+0.418 ms. Page-based LEAF2 collection reduced the repeated `list_dup` scan from
+2.841 ms before the specialization to 0.679 ms, a 4.18x improvement. The
+separate `MDB_MULTIPLE` write run issued 256 calls of 4096 values and reached
+18.781 million values/second, a 1.344x speedup over scalar LEAF2 append. The
+footprint is the environment page high-water mark, not a compacted or live-page
+size; benchmark results will vary with hardware and cache state.
+
 ## Startup Benchmark
 
 `startup_bench` measures isolated database reopen cost across four variants:
@@ -370,12 +443,12 @@ Most Datalevin Datalog query workloads first seek to a key and then read every
 duplicate in that set (analog to reading a row in row based RDBMS). Walking
 `MDB_NEXT_DUP` for each value is cache-unfriendly, so LMDB now exposes
 `mdb_cursor_list_dup()`: once a cursor is positioned on a key,
-`mdb_cursor_list_dup(cursor, &vals, &count)` materializes all inline duplicates
-into the cursor’s leaf cache and returns a read-only array of `MDB_val`
-structures. When the duplicates were promoted to a sub-database (very large
-dupsets) the call falls back to `MDB_INCOMPATIBLE`, signalling the caller to use
-the classic loop. Prefix-compressed counted databases benefit automatically
-because the decoded-leaf cache is already hot.
+`mdb_cursor_list_dup(cursor, &vals, &count)` returns a read-only array of
+`MDB_val` structures for all duplicates, including sets promoted to nested
+B-trees. Promoted `MDB_DUPFIXED` sets use the
+[LEAF2 page specialization](#leaf2-read-side-specialization) described above.
+Normal prefix-compressed DUPSORT trees retain the scalar decode-and-copy
+fallback, using cursor-owned storage so values remain valid after traversal.
 
 `dup_iter_bench` compares the fast path with the old per-duplicate loop:
 

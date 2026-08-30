@@ -857,7 +857,10 @@ test_concurrent_readers(void)
 
     CHECK(mdb_env_create(&env), "concurrent env create");
     CHECK(mdb_env_set_maxdbs(env, 4), "concurrent env maxdbs");
-    CHECK(mdb_env_open(env, dir, MDB_NOLOCK, 0664), "concurrent env open");
+    /* The reader and writer threads rely on LMDB's reader table and writer
+     * mutex. MDB_NOLOCK is only valid when the caller supplies equivalent
+     * coordination, which this test deliberately does not. */
+    CHECK(mdb_env_open(env, dir, 0, 0664), "concurrent env open");
 
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "concurrent setup begin");
     CHECK(mdb_dbi_open(txn, "concurrent", MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &dbi),
@@ -4179,6 +4182,348 @@ test_basics(MDB_env *env)
 
 }
 
+static void
+encode_u64_be(unsigned char out[8], uint64_t value)
+{
+    for (int i = 7; i >= 0; --i) {
+        out[i] = (unsigned char)(value & 0xffu);
+        value >>= 8;
+    }
+}
+
+static void
+test_counted_dupfixed_multiple(MDB_env *env)
+{
+    enum {
+        key_count = 400,
+        values_per_key = 32,
+        hot_value_count = 6000,
+        scalar_appended_hot_values = 1,
+        bulk_appended_hot_values = 512,
+        appended_hot_values = scalar_appended_hot_values +
+                              bulk_appended_hot_values,
+        deleted_hot_values = 100
+    };
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_cursor *cursor;
+    MDB_val key;
+    MDB_val multiple[2];
+    unsigned char values[values_per_key][8];
+    unsigned char hot_values[hot_value_count][8];
+    char keybuf[16];
+    uint64_t total;
+
+    for (uint64_t i = 0; i < values_per_key; ++i)
+        encode_u64_be(values[i], i);
+    for (uint64_t i = 0; i < hot_value_count; ++i)
+        encode_u64_be(hot_values[i], i);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed multiple begin");
+    CHECK(mdb_dbi_open(txn, "counted_dupfixed_multiple",
+                       MDB_CREATE | MDB_COUNTED | MDB_DUPSORT |
+                       MDB_DUPFIXED | MDB_PREFIX_COMPRESSION, &dbi),
+          "counted dupfixed multiple open");
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "counted dupfixed multiple cursor");
+
+    for (int k = 0; k < key_count; ++k) {
+        snprintf(keybuf, sizeof(keybuf), "m%04d", k);
+        key.mv_size = strlen(keybuf);
+        key.mv_data = keybuf;
+        multiple[0].mv_size = sizeof(values[0]);
+        multiple[0].mv_data = values;
+        multiple[1].mv_size = values_per_key;
+        multiple[1].mv_data = NULL;
+        CHECK(mdb_cursor_put(cursor, &key, multiple,
+                             MDB_MULTIPLE | MDB_APPENDDUP),
+              "counted dupfixed multiple put");
+        expect_eq(multiple[1].mv_size, values_per_key,
+                  "counted dupfixed multiple processed");
+    }
+
+    key.mv_size = strlen("z-hot");
+    key.mv_data = "z-hot";
+    multiple[0].mv_size = sizeof(hot_values[0]);
+    multiple[0].mv_data = hot_values;
+    multiple[1].mv_size = hot_value_count;
+    multiple[1].mv_data = NULL;
+    CHECK(mdb_cursor_put(cursor, &key, multiple,
+                         MDB_MULTIPLE | MDB_APPENDDUP),
+          "counted dupfixed hot multiple put");
+    expect_eq(multiple[1].mv_size, hot_value_count,
+              "counted dupfixed hot processed");
+    mdb_cursor_close(cursor);
+    CHECK(mdb_txn_commit(txn), "counted dupfixed multiple commit");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed scalar append begin");
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "counted dupfixed scalar append cursor");
+    MDB_cursor *observer;
+    CHECK(mdb_cursor_open(txn, dbi, &observer),
+          "counted dupfixed observer cursor");
+    MDB_val hot_key = {strlen("z-hot"), "z-hot"};
+    MDB_val observed_key = hot_key;
+    MDB_val observed_data = {0, NULL};
+    CHECK(mdb_cursor_get(observer, &observed_key, &observed_data,
+                         MDB_SET_KEY),
+          "counted dupfixed observer seek");
+    CHECK(mdb_cursor_get(observer, &observed_key, &observed_data,
+                         MDB_LAST_DUP),
+          "counted dupfixed observer last");
+    expect_val_bytes(&observed_data, hot_values[hot_value_count - 1],
+                     sizeof(hot_values[0]),
+                     "counted dupfixed observer original last");
+
+    unsigned char appended_hot[8];
+    encode_u64_be(appended_hot, hot_value_count);
+    MDB_val appended_data = {sizeof(appended_hot), appended_hot};
+    CHECK(mdb_cursor_put(cursor, &hot_key, &appended_data, MDB_APPENDDUP),
+          "counted dupfixed scalar append");
+    mdb_size_t live_duplicate_count = 0;
+    CHECK(mdb_cursor_count(observer, &live_duplicate_count),
+          "counted dupfixed observer count after scalar append");
+    expect_eq(live_duplicate_count,
+              hot_value_count + scalar_appended_hot_values,
+              "counted dupfixed observer scalar append count");
+
+    unsigned char bulk_appended[bulk_appended_hot_values][8];
+    for (uint64_t i = 0; i < bulk_appended_hot_values; ++i)
+        encode_u64_be(bulk_appended[i], hot_value_count + 1 + i);
+    multiple[0].mv_size = sizeof(bulk_appended[0]);
+    multiple[0].mv_data = bulk_appended;
+    multiple[1].mv_size = bulk_appended_hot_values;
+    multiple[1].mv_data = NULL;
+    CHECK(mdb_cursor_put(cursor, &hot_key, multiple,
+                         MDB_MULTIPLE | MDB_APPENDDUP),
+          "counted dupfixed live-cursor multiple append");
+    expect_eq(multiple[1].mv_size, bulk_appended_hot_values,
+              "counted dupfixed live-cursor multiple processed");
+    CHECK(mdb_cursor_count(observer, &live_duplicate_count),
+          "counted dupfixed observer count after multiple append");
+    expect_eq(live_duplicate_count, hot_value_count + appended_hot_values,
+              "counted dupfixed observer multiple append count");
+
+    CHECK(mdb_cursor_get(observer, &observed_key, &observed_data,
+                         MDB_GET_CURRENT),
+          "counted dupfixed observer current after append");
+    expect_val_bytes(&observed_data, hot_values[hot_value_count - 1],
+                     sizeof(hot_values[0]),
+                     "counted dupfixed observer stable after append");
+    CHECK(mdb_cursor_get(observer, &observed_key, &observed_data,
+                         MDB_NEXT_DUP),
+          "counted dupfixed observer next after append");
+    expect_val_bytes(&observed_data, appended_hot, sizeof(appended_hot),
+                     "counted dupfixed observer sees scalar append");
+    mdb_cursor_close(observer);
+    mdb_cursor_close(cursor);
+    CHECK(mdb_txn_commit(txn), "counted dupfixed scalar append commit");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed invalid multiple begin");
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "counted dupfixed invalid multiple cursor");
+    unsigned char invalid_values[2][8];
+    encode_u64_be(invalid_values[0], hot_value_count + appended_hot_values + 2);
+    encode_u64_be(invalid_values[1], hot_value_count + appended_hot_values + 1);
+    multiple[0].mv_size = sizeof(invalid_values[0]);
+    multiple[0].mv_data = invalid_values;
+    multiple[1].mv_size = 2;
+    multiple[1].mv_data = NULL;
+    int rc = mdb_cursor_put(cursor, &hot_key, multiple,
+                            MDB_MULTIPLE | MDB_APPENDDUP);
+    expect_rc(rc, MDB_KEYEXIST,
+              "counted dupfixed invalid multiple ordering");
+    expect_eq(multiple[1].mv_size, 0,
+              "counted dupfixed invalid multiple processed");
+
+    unsigned char valid_after_invalid[8];
+    encode_u64_be(valid_after_invalid,
+                  hot_value_count + appended_hot_values + 1);
+    MDB_val valid_data = {sizeof(valid_after_invalid), valid_after_invalid};
+    CHECK(mdb_cursor_put(cursor, &hot_key, &valid_data, MDB_APPENDDUP),
+          "counted dupfixed usable after invalid multiple");
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed wrong width begin");
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "counted dupfixed wrong width cursor");
+    multiple[0].mv_size = sizeof(appended_hot);
+    multiple[0].mv_data = appended_hot;
+    multiple[1].mv_size = 0;
+    multiple[1].mv_data = NULL;
+    rc = mdb_cursor_put(cursor, &hot_key, multiple,
+                        MDB_MULTIPLE | MDB_APPENDDUP);
+    expect_rc(rc, MDB_BAD_VALSIZE,
+              "counted dupfixed empty multiple");
+    expect_eq(multiple[1].mv_size, 0,
+              "counted dupfixed empty multiple processed");
+
+    unsigned char wrong_width_values[2][7] = {{0}, {1}};
+    multiple[0].mv_size = sizeof(wrong_width_values[0]);
+    multiple[0].mv_data = wrong_width_values;
+    multiple[1].mv_size = 2;
+    multiple[1].mv_data = NULL;
+    rc = mdb_cursor_put(cursor, &hot_key, multiple,
+                        MDB_MULTIPLE | MDB_APPENDDUP);
+    expect_rc(rc, MDB_BAD_VALSIZE,
+              "counted dupfixed wrong multiple width");
+    expect_eq(multiple[1].mv_size, 0,
+              "counted dupfixed wrong width processed");
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "counted dupfixed multiple read");
+    CHECK(mdb_count_all(txn, dbi, 0, &total),
+          "counted dupfixed multiple count all");
+    expect_eq(total, (uint64_t)key_count * values_per_key + hot_value_count +
+              appended_hot_values,
+              "counted dupfixed multiple total");
+
+    MDB_val low = {strlen("m0050"), "m0050"};
+    MDB_val high = {strlen("m0349"), "m0349"};
+    CHECK(mdb_range_count_values(txn, dbi, &low, &high,
+                                 MDB_COUNT_LOWER_INCL |
+                                 MDB_COUNT_UPPER_INCL, &total),
+          "counted dupfixed multiple value range");
+    expect_eq(total, 300u * values_per_key,
+              "counted dupfixed multiple value range total");
+    CHECK(mdb_range_count_keys(txn, dbi, &low, &high,
+                               MDB_COUNT_LOWER_INCL |
+                               MDB_COUNT_UPPER_INCL, &total),
+          "counted dupfixed multiple key range");
+    expect_eq(total, 300, "counted dupfixed multiple key range total");
+
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "counted dupfixed multiple read cursor");
+    MDB_val hot_data = {0, NULL};
+    CHECK(mdb_cursor_get(cursor, &hot_key, &hot_data, MDB_SET_KEY),
+          "counted dupfixed hot seek");
+    mdb_size_t duplicate_count = 0;
+    CHECK(mdb_cursor_count(cursor, &duplicate_count),
+          "counted dupfixed hot cursor count");
+    expect_eq(duplicate_count, hot_value_count + appended_hot_values,
+              "counted dupfixed hot cursor count total");
+
+    uint64_t hot_rank = (uint64_t)key_count * values_per_key;
+    MDB_val ranked_key, ranked_data;
+    CHECK(mdb_cursor_get_rank(cursor, hot_rank, &ranked_key, &ranked_data, 0),
+          "counted dupfixed hot rank");
+    expect_val_eq(&ranked_key, "z-hot", "counted dupfixed hot rank key");
+    expect_val_bytes(&ranked_data, hot_values[0], sizeof(hot_values[0]),
+                     "counted dupfixed hot rank data");
+    uint64_t observed_rank = UINT64_MAX;
+    MDB_val last_hot = {sizeof(hot_values[hot_value_count - 1]),
+                        hot_values[hot_value_count - 1]};
+    CHECK(mdb_cursor_key_rank(cursor, &hot_key, &last_hot, 0,
+                              &observed_rank),
+          "counted dupfixed last hot key rank");
+    expect_eq(observed_rank, hot_rank + hot_value_count - 1,
+              "counted dupfixed last hot rank total");
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed delete begin");
+    hot_key.mv_size = strlen("z-hot");
+    hot_key.mv_data = "z-hot";
+    CHECK(mdb_cursor_open(txn, dbi, &observer),
+          "counted dupfixed delete observer cursor");
+    CHECK(mdb_cursor_get(observer, &hot_key, &hot_data, MDB_SET_KEY),
+          "counted dupfixed delete observer seek");
+    for (int i = 0; i < deleted_hot_values; ++i) {
+        MDB_val value = {sizeof(hot_values[i]), hot_values[i]};
+        CHECK(mdb_del(txn, dbi, &hot_key, &value),
+              "counted dupfixed delete value");
+    }
+    CHECK(mdb_cursor_count(observer, &live_duplicate_count),
+          "counted dupfixed observer count after deletes");
+    expect_eq(live_duplicate_count,
+              hot_value_count + appended_hot_values - deleted_hot_values,
+              "counted dupfixed observer delete count");
+    mdb_cursor_close(observer);
+    CHECK(mdb_txn_commit(txn), "counted dupfixed delete commit");
+
+    mdb_dbi_close(env, dbi);
+    CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+          "counted dupfixed reopen begin");
+    CHECK(mdb_dbi_open(txn, "counted_dupfixed_multiple",
+                       MDB_COUNTED | MDB_DUPSORT | MDB_DUPFIXED |
+                       MDB_PREFIX_COMPRESSION, &dbi),
+          "counted dupfixed reopen");
+    CHECK(mdb_count_all(txn, dbi, 0, &total),
+          "counted dupfixed reopen count all");
+    expect_eq(total,
+              (uint64_t)key_count * values_per_key + hot_value_count -
+              deleted_hot_values + appended_hot_values,
+              "counted dupfixed reopen total");
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "counted dupfixed drop begin");
+    CHECK(mdb_dbi_open(txn, "counted_dupfixed_multiple",
+                       MDB_COUNTED | MDB_DUPSORT | MDB_DUPFIXED |
+                       MDB_PREFIX_COMPRESSION, &dbi),
+          "counted dupfixed drop reopen");
+    CHECK(mdb_drop(txn, dbi, 1), "counted dupfixed drop");
+    CHECK(mdb_txn_commit(txn), "counted dupfixed drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
+static void
+test_dupfixed_multiple_wide_count(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    MDB_cursor *cursor;
+    unsigned char seed = 0;
+    unsigned char item = 1;
+    MDB_val key = {strlen("wide"), "wide"};
+    MDB_val data = {sizeof(seed), &seed};
+    MDB_val multiple[2] = {
+        {sizeof(item), &item},
+        {(size_t)UINT_MAX, NULL}
+    };
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "dupfixed wide count create begin");
+    CHECK(mdb_dbi_open(txn, "dupfixed_wide_count",
+                       MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED, &dbi),
+          "dupfixed wide count open");
+    CHECK(mdb_put(txn, dbi, &key, &data, 0),
+          "dupfixed wide count seed");
+    CHECK(mdb_txn_commit(txn), "dupfixed wide count create commit");
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "dupfixed wide count begin");
+    CHECK(mdb_cursor_open(txn, dbi, &cursor),
+          "dupfixed wide count cursor");
+    /* The interrupt stops the operation before it traverses the intentionally
+     * small backing buffer, but only after MDB_MULTIPLE count validation. */
+    CHECK(mdb_env_set_interrupt(env, 1),
+          "dupfixed wide count interrupt set");
+    int rc = mdb_cursor_put(cursor, &key, multiple,
+                            MDB_MULTIPLE | MDB_APPENDDUP);
+    CHECK(mdb_env_set_interrupt(env, 0),
+          "dupfixed wide count interrupt clear");
+    expect_rc(rc, EINTR, "dupfixed UINT_MAX count accepted");
+    expect_eq(multiple[1].mv_size, 0,
+              "dupfixed UINT_MAX count processed");
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "dupfixed wide count drop begin");
+    CHECK(mdb_drop(txn, dbi, 1), "dupfixed wide count drop");
+    CHECK(mdb_txn_commit(txn), "dupfixed wide count drop commit");
+    mdb_dbi_close(env, dbi);
+}
+
 int
 main(void)
 {
@@ -4215,6 +4560,8 @@ main(void)
     test_range_count_values(env);
     test_range_count_keys_dupsort(env);
     test_range_count_values_raw(env);
+    test_counted_dupfixed_multiple(env);
+    test_dupfixed_multiple_wide_count(env);
     test_range_count_values_many_env();
     test_count_all_plain(env);
     test_count_all_dupsort(env);

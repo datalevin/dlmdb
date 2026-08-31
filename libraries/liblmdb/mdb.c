@@ -592,7 +592,15 @@ static int mdb_mutex_failed(MDB_env *env, mdb_mutexref_t mutex, int rc);
 #endif
 
 #ifndef MDB_MSYNC
-# define MDB_MSYNC(addr,len,flags)	msync(addr,len,flags)
+# if defined(__APPLE__)
+/* Linux has made pure MS_ASYNC a no-op since 2.6.19. Darwin tracks dirty
+ * mapped pages too, but its MS_ASYNC still performs costly writeback work.
+ */
+#  define MDB_MSYNC(addr,len,flags) \
+	((flags) == MS_ASYNC ? 0 : msync(addr,len,flags))
+# else
+#  define MDB_MSYNC(addr,len,flags)	msync(addr,len,flags)
+# endif
 #endif
 
 #ifndef MS_SYNC

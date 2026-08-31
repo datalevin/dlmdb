@@ -12005,6 +12005,113 @@ found:
 	return MDB_SUCCESS;
 }
 
+/** Do not spill pages to disk if txn is getting full, may fail instead */
+#define MDB_NOSPILL	0x8000
+
+static int
+mdb_leaf2_validate_multiple(MDB_cursor *mc, MDB_val *values,
+	unsigned int count, MDB_cmp_func *cmp)
+{
+	const unsigned char *src = values->mv_data;
+	size_t ksize = values->mv_size;
+	int rc;
+
+	if (!src || !count || !ksize || !cmp)
+		return MDB_BAD_VALSIZE;
+	if (cmp == mdb_cmp_int && ksize != sizeof(unsigned int) &&
+	    ksize != sizeof(mdb_size_t))
+		return MDB_BAD_VALSIZE;
+	if (NEED_CMP_CLONG(cmp, ksize))
+		cmp = mdb_cmp_clong;
+	for (unsigned int i = 1; i < count; ++i) {
+		MDB_val prev = {ksize, (void *)(src + (size_t)(i - 1) * ksize)};
+		MDB_val next = {ksize, (void *)(src + (size_t)i * ksize)};
+
+		if (!(i & 0xfff)) {
+			rc = mdb_txn_check_interrupt(mc->mc_txn);
+			if (rc != MDB_SUCCESS)
+				return rc;
+		}
+		if (cmp(&next, &prev) <= 0)
+			return MDB_KEYEXIST;
+	}
+	return MDB_SUCCESS;
+}
+
+/** Choose one inline LEAF2 allocation for an entire packed append. */
+static int
+mdb_leaf2_inline_capacity(MDB_env *env, size_t key_size, size_t ksize,
+	size_t count, size_t current, size_t *capacity)
+{
+	size_t node_bytes = NODESIZE + EVEN(key_size);
+	size_t max_data, required, desired, slots;
+
+	if (!ksize || count > (SIZE_MAX - PAGEHDRSZ) / ksize)
+		return MDB_BAD_VALSIZE;
+	required = PAGEHDRSZ + count * ksize;
+	if (node_bytes > env->me_nodemax)
+		return MDB_PAGE_FULL;
+	max_data = env->me_nodemax - node_bytes;
+	if (required > max_data)
+		return MDB_PAGE_FULL;
+
+	/* Keep the existing four-value growth granularity when it still fits. */
+	slots = count < 4 ? 4 : count;
+	if (slots <= SIZE_MAX - 3)
+		slots = (slots + 3) & ~(size_t)3;
+	if (slots > (SIZE_MAX - PAGEHDRSZ) / ksize)
+		desired = required;
+	else
+		desired = PAGEHDRSZ + slots * ksize;
+	if (desired > max_data)
+		desired = required;
+	if (desired < current)
+		desired = current;
+	*capacity = desired;
+	return MDB_SUCCESS;
+}
+
+/** Build an inline LEAF2 page from up to two contiguous packed runs. */
+static int
+mdb_leaf2_build_multiple(MDB_page *mp, pgno_t pgno, size_t capacity,
+	size_t ksize, const void *prefix, size_t prefix_count,
+	const void *values, size_t count)
+{
+	size_t total = prefix_count + count;
+	size_t payload;
+	ptrdiff_t upper, delta;
+
+	if (!mp || !ksize || prefix_count > SIZE_MAX - count ||
+	    (prefix_count && !prefix) || (count && !values))
+		return MDB_BAD_VALSIZE;
+	if (total > (SIZE_MAX - PAGEHDRSZ) / ksize)
+		return MDB_BAD_VALSIZE;
+	payload = total * ksize;
+	if (capacity < PAGEHDRSZ || payload > capacity - PAGEHDRSZ ||
+	    total > ((indx_t)-1 - (PAGEHDRSZ - PAGEBASE)) /
+	    sizeof(indx_t))
+		return MDB_PAGE_FULL;
+
+	memset(mp, 0, capacity);
+	MP_SETPGNO(mp, pgno);
+	MP_FLAGS(mp) = P_LEAF|P_LEAF2|P_DIRTY|P_SUBP;
+	MP_PAD(mp) = (uint16_t)ksize;
+	MP_LOWER(mp) = (indx_t)((PAGEHDRSZ - PAGEBASE) +
+	    total * sizeof(indx_t));
+	upper = (ptrdiff_t)(capacity - PAGEBASE);
+	delta = (ptrdiff_t)ksize - (ptrdiff_t)sizeof(indx_t);
+	upper -= (ptrdiff_t)total * delta;
+	if (upper < 0 || (size_t)upper > (size_t)((indx_t)~0))
+		return MDB_PAGE_FULL;
+	MP_UPPER(mp) = (indx_t)upper;
+	if (prefix_count)
+		memcpy(METADATA(mp), prefix, prefix_count * ksize);
+	if (count)
+		memcpy((unsigned char *)METADATA(mp) + prefix_count * ksize,
+		    values, count * ksize);
+	return MDB_SUCCESS;
+}
+
 /** Append one fixed-size key to an existing LEAF2 tree.
  *
  * This is the steady-state sorted-duplicate path used by MDB_APPENDDUP.
@@ -12105,7 +12212,7 @@ mdb_leaf2_append_run(MDB_cursor *mc, const void *values, unsigned int count)
 }
 
 static int
-mdb_leaf2_append_multiple(MDB_cursor *mc, MDB_val *values,
+mdb_leaf2_append_multiple_validated(MDB_cursor *mc, MDB_val *values,
 	unsigned int count, unsigned int *inserted)
 {
 	const unsigned char *src = values->mv_data;
@@ -12115,21 +12222,8 @@ mdb_leaf2_append_multiple(MDB_cursor *mc, MDB_val *values,
 
 	if (inserted)
 		*inserted = 0;
-	if (!src || !count || ksize != mc->mc_db->md_pad)
+	if (!src || !count || !ksize || ksize != mc->mc_db->md_pad)
 		return MDB_BAD_VALSIZE;
-
-	/* Validate the caller's append promise before changing any pages. */
-	for (unsigned int i = 1; i < count; ++i) {
-		MDB_val prev = {ksize, (void *)(src + (size_t)(i - 1) * ksize)};
-		MDB_val next = {ksize, (void *)(src + (size_t)i * ksize)};
-		if (!(i & 0xfff)) {
-			rc = mdb_txn_check_interrupt(mc->mc_txn);
-			if (rc != MDB_SUCCESS)
-				return rc;
-		}
-		if (mc->mc_dbx->md_cmp(&next, &prev) <= 0)
-			return MDB_KEYEXIST;
-	}
 
 	while (done < count) {
 		MDB_page *mp;
@@ -12145,7 +12239,13 @@ mdb_leaf2_append_multiple(MDB_cursor *mc, MDB_val *values,
 			}
 		}
 
-		rc = mdb_leaf2_append(mc, &next);
+		if (!mc->mc_db->md_entries) {
+			MDB_val empty = {0, (void *)""};
+
+			rc = _mdb_cursor_put(mc, &next, &empty, MDB_NOSPILL);
+		} else {
+			rc = mdb_leaf2_append(mc, &next);
+		}
 		if (rc != MDB_SUCCESS) {
 			if (inserted)
 				*inserted = done;
@@ -12172,9 +12272,6 @@ mdb_leaf2_append_multiple(MDB_cursor *mc, MDB_val *values,
 	return MDB_SUCCESS;
 }
 
-/** Do not spill pages to disk if txn is getting full, may fail instead */
-#define MDB_NOSPILL	0x8000
-
 static int
 _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	unsigned int flags)
@@ -12189,7 +12286,10 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	int64_t insert_data;
 	int split_performed = 0;
 	int inline_pair_ready = 0;
+	int inline_ready_new_dupdata = 0;
+	int bulk_multiple = 0;
 	int64_t multiple_value_delta = 0;
+	unsigned int inline_ready_added = 0;
 	unsigned int mcount = 0, dcount = 0, multiple_step = 1, nospill;
 	size_t nsize;
 	int rc, rc2;
@@ -12214,6 +12314,8 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 		dcount = (unsigned int)requested;
 		if (!F_ISSET(mc->mc_db->md_flags, MDB_DUPFIXED))
 			return MDB_INCOMPATIBLE;
+		bulk_multiple = dcount > 1 && (flags & MDB_APPENDDUP) &&
+		    !(flags & (MDB_CURRENT|MDB_NODUPDATA|MDB_NOOVERWRITE));
 	}
 
 	nospill = flags & MDB_NOSPILL;
@@ -12241,6 +12343,12 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	if ((mc->mc_db->md_flags & MDB_DUPSORT) && data->mv_size > ENV_MAXKEY(env))
 		return MDB_BAD_VALSIZE;
 #endif
+	if (bulk_multiple) {
+		rc = mdb_leaf2_validate_multiple(mc, data, dcount,
+		    mc->mc_dbx->md_dcmp);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
 
 	DPRINTF(("==> put db %d key [%s], size %"Z"u, data size %"Z"u",
 		DDBI(mc), DKEY(key), key ? key->mv_size : 0, data->mv_size));
@@ -12331,6 +12439,41 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	if (insert_key) {
 		/* The key does not exist */
 		DPRINTF(("inserting key at index %i", mc->mc_ki[mc->mc_top]));
+		if (bulk_multiple) {
+			size_t capacity = 0;
+
+			rc2 = mdb_leaf2_inline_capacity(env, key->mv_size +
+			    ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) ? 1 : 0),
+			    data->mv_size, dcount, 0, &capacity);
+			if (rc2 == MDB_SUCCESS) {
+				fp = env->me_pbuf;
+				rc2 = mdb_leaf2_build_multiple(fp,
+				    MP_PGNO(mc->mc_pg[mc->mc_top]), capacity,
+				    data->mv_size, NULL, 0, data->mv_data, dcount);
+				if (rc2 != MDB_SUCCESS)
+					return rc2;
+				xdata.mv_size = capacity;
+				xdata.mv_data = fp;
+				rdata = &xdata;
+				flags |= F_DUPDATA;
+				inline_pair_ready = 1;
+				inline_ready_new_dupdata = 1;
+				inline_ready_added = dcount;
+				insert_data = dcount;
+				multiple_step = dcount;
+				goto new_sub;
+			}
+			if (rc2 != MDB_PAGE_FULL)
+				return rc2;
+
+			/* Start one real duplicate tree; the packed helper fills it below. */
+			fp_flags = P_LEAF|P_LEAF2|P_DIRTY;
+			fp = env->me_pbuf;
+			fp->mp_pad = data->mv_size;
+			MP_LOWER(fp) = MP_UPPER(fp) = (PAGEHDRSZ-PAGEBASE);
+			olddata.mv_size = PAGEHDRSZ;
+			goto prep_subDB;
+		}
 		if ((mc->mc_db->md_flags & MDB_DUPSORT) &&
 			LEAFSIZE(key, data) > env->me_nodemax)
 		{
@@ -12413,6 +12556,50 @@ more:
 				/* does data match? */
 				cmp = dcmp(data, &olddata);
 				unsigned int insert_index = (cmp < 0) ? 0 : 1;
+				if (bulk_multiple) {
+					size_t capacity = 0;
+
+					if (olddata.mv_size != data->mv_size)
+						return MDB_BAD_VALSIZE;
+					if (cmp <= 0)
+						return MDB_KEYEXIST;
+					rc2 = mdb_leaf2_inline_capacity(env,
+					    key->mv_size + (parent_prefix ? 1 : 0), data->mv_size,
+					    (size_t)dcount + 1, 0, &capacity);
+					if (rc2 == MDB_SUCCESS) {
+						rc2 = mdb_leaf2_build_multiple(fp,
+						    MP_PGNO(mc->mc_pg[mc->mc_top]), capacity,
+						    data->mv_size, olddata.mv_data, 1,
+						    data->mv_data, dcount);
+						if (rc2 != MDB_SUCCESS)
+							return rc2;
+						xdata.mv_size = capacity;
+						xdata.mv_data = fp;
+						rdata = &xdata;
+						flags |= F_DUPDATA;
+						inline_pair_ready = 1;
+						inline_ready_new_dupdata = 1;
+						inline_ready_added = dcount;
+						insert_data = dcount;
+						multiple_step = dcount;
+						mdb_node_del(mc, 0);
+						goto new_sub;
+					}
+					if (rc2 != MDB_PAGE_FULL)
+						return rc2;
+
+					/* Seed the promoted tree with the original duplicate. */
+					dkey.mv_size = olddata.mv_size;
+					dkey.mv_data = memcpy(fp + 1, olddata.mv_data,
+					    olddata.mv_size);
+					MP_FLAGS(fp) = P_LEAF|P_LEAF2|P_DIRTY;
+					MP_PAD(fp) = (uint16_t)data->mv_size;
+					MP_LOWER(fp) = MP_UPPER(fp) =
+					    (PAGEHDRSZ-PAGEBASE);
+					olddata.mv_size = PAGEHDRSZ;
+					fp_flags = MP_FLAGS(fp);
+					goto prep_subDB;
+				}
 				if (!cmp) {
 					if (flags & (MDB_NODUPDATA|MDB_APPENDDUP))
 						return MDB_KEYEXIST;
@@ -12479,6 +12666,8 @@ more:
 					if (rc2 != MDB_SUCCESS)
 						return rc2;
 					inline_pair_ready = 1;
+					inline_ready_new_dupdata = 1;
+					inline_ready_added = 1;
 					dkey.mv_size = 0;
 					dkey.mv_data = NULL;
 				}
@@ -12505,6 +12694,56 @@ more:
 
 				mdb_xcursor_init1(mc, leaf);
 				mx = &mc->mc_xcursor->mx_cursor;
+				if (bulk_multiple) {
+					size_t old_count = NUMKEYS(fp);
+					size_t capacity = 0;
+					size_t step = fp->mp_pad;
+					MDB_val last;
+
+					if (!IS_LEAF2(fp) || step != data->mv_size ||
+					    !old_count)
+						return MDB_BAD_VALSIZE;
+					last.mv_size = step;
+					last.mv_data = LEAF2KEY(fp, old_count - 1, step);
+					if (mx->mc_dbx->md_cmp(data, &last) <= 0)
+						return MDB_KEYEXIST;
+					rc2 = mdb_leaf2_inline_capacity(env,
+					    key->mv_size + (parent_prefix ? 1 : 0), step,
+					    old_count + dcount,
+					    olddata.mv_size, &capacity);
+					if (rc2 == MDB_SUCCESS &&
+					    capacity == olddata.mv_size) {
+						mdb_leaf2_append_run(mx, data->mv_data, dcount);
+						mx->mc_flags |= C_EOF;
+						mdb_xcursor_sync_db(mc, mc->mc_xcursor);
+						insert_data = dcount;
+						multiple_step = dcount;
+						rc = MDB_SUCCESS;
+						goto finish_put;
+					}
+					if (rc2 == MDB_SUCCESS) {
+						rc2 = mdb_leaf2_build_multiple(mp,
+						    MP_PGNO(mc->mc_pg[mc->mc_top]), capacity,
+						    step, METADATA(fp), old_count,
+						    data->mv_data, dcount);
+						if (rc2 != MDB_SUCCESS)
+							return rc2;
+						xdata.mv_size = capacity;
+						xdata.mv_data = mp;
+						rdata = &xdata;
+						flags |= F_DUPDATA;
+						inline_pair_ready = 1;
+						inline_ready_new_dupdata = 0;
+						inline_ready_added = dcount;
+						insert_data = dcount;
+						multiple_step = dcount;
+						mdb_node_del(mc, 0);
+						goto new_sub;
+					}
+					if (rc2 != MDB_PAGE_FULL)
+						return rc2;
+					force_subdb = 1;
+				}
 
 				if (flags & MDB_APPENDDUP) {
 					dup_index = NUMKEYS(fp);
@@ -12801,9 +13040,14 @@ finish_put:
 	if (rc == MDB_SUCCESS) {
 		if (inline_pair_ready && !do_sub && mc->mc_xcursor) {
 			leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
-				mdb_xcursor_init1(mc, leaf);
+			mdb_xcursor_init1(mc, leaf);
 			if (mc->mc_db->md_flags & MDB_DUPSORT)
-				insert_data = 1;
+				insert_data = inline_ready_added ? inline_ready_added : 1;
+			if (bulk_multiple) {
+				MDB_cursor *mxcur = &mc->mc_xcursor->mx_cursor;
+				mxcur->mc_ki[0] = NUMKEYS(mxcur->mc_pg[0]) - 1;
+				mxcur->mc_flags |= C_EOF;
+			}
 			{
 				MDB_cursor *m2;
 				unsigned i = mc->mc_top;
@@ -12818,7 +13062,8 @@ finish_put:
 					if (m2->mc_pg[i] != mp)
 						continue;
 					if (m2->mc_ki[i] == mc->mc_ki[i]) {
-						mdb_xcursor_init2(m2, mx, 1);
+						mdb_xcursor_init2(m2, mx,
+						    inline_ready_new_dupdata);
 					} else if (!insert_key) {
 						XCURSOR_REFRESH(m2, i, mp);
 					}
@@ -12880,13 +13125,13 @@ put_sub:
 			ecount = mc->mc_xcursor->mx_db.md_entries;
 			if (flags & MDB_APPENDDUP)
 				xflags |= MDB_APPEND;
-			if ((flags & MDB_MULTIPLE) && (xflags & MDB_APPEND) &&
+			if (bulk_multiple && (xflags & MDB_APPEND) &&
 			    !(xflags & (MDB_CURRENT|MDB_NOOVERWRITE)) &&
-			    (leaf->mn_flags & F_SUBDATA) && !sub_root &&
+			    (leaf->mn_flags & F_SUBDATA) &&
 			    (mc->mc_db->md_flags & MDB_DUPFIXED) &&
 			    dcount - mcount > 1) {
 				unsigned int inserted = 0;
-				rc = mdb_leaf2_append_multiple(
+				rc = mdb_leaf2_append_multiple_validated(
 				    &mc->mc_xcursor->mx_cursor, data,
 				    dcount - mcount, &inserted);
 				multiple_step = inserted;

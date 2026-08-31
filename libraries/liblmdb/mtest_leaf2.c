@@ -1153,6 +1153,200 @@ lf_seed_database(LFFuzz *fuzz, MDB_env *env, MDB_dbi dbi, LFModel *model)
 }
 
 static void
+lf_bulk_append_run(LFFuzz *fuzz, MDB_cursor *cursor, LFModel *model,
+	size_t key_index, size_t first, size_t count, unsigned char *values)
+{
+	MDB_val key, multiple[2];
+	char keybuf[LF_KEY_BUFSIZE];
+	size_t index;
+
+	for (index = 0; index < count; ++index)
+		lf_encode_value(fuzz, first + index,
+		    values + index * fuzz->width);
+	key = lf_key(key_index, keybuf);
+	multiple[0].mv_size = fuzz->width;
+	multiple[0].mv_data = values;
+	multiple[1].mv_size = count;
+	multiple[1].mv_data = NULL;
+	lf_check(fuzz, mdb_cursor_put(cursor, &key, multiple,
+	    MDB_MULTIPLE | MDB_APPENDDUP), "focused multiple append");
+	if (multiple[1].mv_size != count)
+		lf_fail(fuzz, "focused append processed %zu of %zu values",
+		    multiple[1].mv_size, count);
+	for (index = 0; index < count; ++index)
+		lf_model_add(fuzz, model, key_index, first + index);
+}
+
+/** Exercise every packed-write starting state before randomized mutations. */
+static void
+lf_test_bulk_transitions(LFFuzz *fuzz, MDB_env *env, MDB_dbi dbi,
+	LFModel *model)
+{
+	enum { large_count = 20000, tree_append_count = 128 };
+	MDB_txn *txn = NULL;
+	MDB_cursor *writer = NULL, *observer = NULL;
+	MDB_val key, data, multiple[2], current_key, current_data;
+	LFValueBuf encoded;
+	unsigned char *values;
+	char keybuf[LF_KEY_BUFSIZE];
+	mdb_size_t duplicate_count;
+	int rc;
+
+	fuzz->action = "focused bulk transitions";
+	values = malloc((size_t)large_count * fuzz->width);
+	if (!values)
+		lf_fail(fuzz, "cannot allocate focused bulk values");
+	lf_check(fuzz, mdb_txn_begin(env, NULL, 0, &txn),
+	    "focused transaction begin");
+	lf_check(fuzz, mdb_cursor_open(txn, dbi, &writer),
+	    "focused writer open");
+
+	/* Reject a bad packed run before creating a new key. */
+	lf_encode_value(fuzz, 1, values);
+	lf_encode_value(fuzz, 0, values + fuzz->width);
+	key = lf_key(1, keybuf);
+	multiple[0].mv_size = fuzz->width;
+	multiple[0].mv_data = values;
+	multiple[1].mv_size = 2;
+	multiple[1].mv_data = NULL;
+	rc = mdb_cursor_put(writer, &key, multiple,
+	    MDB_MULTIPLE | MDB_APPENDDUP);
+	lf_expect_rc(fuzz, rc, MDB_KEYEXIST, "invalid new-key batch");
+	if (multiple[1].mv_size != 0)
+		lf_fail(fuzz, "invalid new-key batch wrote %zu values",
+		    multiple[1].mv_size);
+	data.mv_size = 0;
+	data.mv_data = NULL;
+	rc = mdb_get(txn, dbi, &key, &data);
+	lf_expect_rc(fuzz, rc, MDB_NOTFOUND, "invalid new key absent");
+
+	/* The same all-or-nothing validation applies to direct and inline data. */
+	for (size_t key_index = 2; key_index <= 3; ++key_index) {
+		size_t first = key_index == 2 ? 2 : 6;
+
+		lf_encode_value(fuzz, first, values);
+		lf_encode_value(fuzz, first - 1, values + fuzz->width);
+		key = lf_key(key_index, keybuf);
+		multiple[1].mv_size = 2;
+		rc = mdb_cursor_put(writer, &key, multiple,
+		    MDB_MULTIPLE | MDB_APPENDDUP);
+		lf_expect_rc(fuzz, rc, MDB_KEYEXIST,
+		    "invalid existing-key batch");
+		if (multiple[1].mv_size != 0)
+			lf_fail(fuzz, "invalid existing batch wrote %zu values",
+			    multiple[1].mv_size);
+	}
+	lf_encode_value(fuzz, 4, values);
+	lf_encode_value(fuzz, 5, values + fuzz->width);
+	key = lf_key(3, keybuf);
+	multiple[1].mv_size = 2;
+	rc = mdb_cursor_put(writer, &key, multiple,
+	    MDB_MULTIPLE | MDB_APPENDDUP);
+	lf_expect_rc(fuzz, rc, MDB_KEYEXIST, "non-appending inline batch");
+	if (multiple[1].mv_size != 0)
+		lf_fail(fuzz, "non-appending inline batch wrote %zu values",
+		    multiple[1].mv_size);
+
+	/* Direct value -> inline LEAF2. */
+	lf_bulk_append_run(fuzz, writer, model, 2, 1, 8, values);
+
+	/* Grow an inline LEAF2 once while preserving a live duplicate cursor. */
+	lf_check(fuzz, mdb_cursor_open(txn, dbi, &observer),
+	    "inline observer open");
+	key = lf_key(3, keybuf);
+	lf_encode_value(fuzz, 2, encoded.bytes);
+	data.mv_size = fuzz->width;
+	data.mv_data = encoded.bytes;
+	lf_check(fuzz, mdb_cursor_get(observer, &key, &data, MDB_GET_BOTH),
+	    "inline observer position");
+	lf_bulk_append_run(fuzz, writer, model, 3, 5, 8, values);
+	lf_check(fuzz, mdb_cursor_count(observer, &duplicate_count),
+	    "inline observer count");
+	if ((size_t)duplicate_count != model->counts[3])
+		lf_fail(fuzz, "inline observer count mismatch");
+	current_key.mv_size = current_data.mv_size = 0;
+	current_key.mv_data = current_data.mv_data = NULL;
+	lf_check(fuzz, mdb_cursor_get(observer, &current_key, &current_data,
+	    MDB_GET_CURRENT), "inline observer current");
+	lf_expect_value(fuzz, &current_data, 2, "inline observer stable");
+	mdb_cursor_close(observer);
+	observer = NULL;
+
+	/* Consume reserved inline capacity without rebuilding the outer node. */
+	lf_check(fuzz, mdb_cursor_open(txn, dbi, &observer),
+	    "in-place observer open");
+	key = lf_key(4, keybuf);
+	lf_encode_value(fuzz, 48, encoded.bytes);
+	data.mv_size = fuzz->width;
+	data.mv_data = encoded.bytes;
+	lf_check(fuzz, mdb_cursor_get(observer, &key, &data, MDB_GET_BOTH),
+	    "in-place observer position");
+	lf_bulk_append_run(fuzz, writer, model, 4, 95, 9, values);
+	lf_bulk_append_run(fuzz, writer, model, 4, 104, 3, values);
+	lf_check(fuzz, mdb_cursor_count(observer, &duplicate_count),
+	    "in-place observer count");
+	if ((size_t)duplicate_count != model->counts[4])
+		lf_fail(fuzz, "in-place observer count mismatch");
+	current_key.mv_size = current_data.mv_size = 0;
+	current_key.mv_data = current_data.mv_data = NULL;
+	lf_check(fuzz, mdb_cursor_get(observer, &current_key, &current_data,
+	    MDB_GET_CURRENT), "in-place observer current");
+	lf_expect_value(fuzz, &current_data, 48, "in-place observer stable");
+	mdb_cursor_close(observer);
+	observer = NULL;
+
+	/* Build a new inline page directly from one packed call. */
+	lf_bulk_append_run(fuzz, writer, model, 7, 0, 10, values);
+
+	/* Promote that page once, bulk-fill its tree, and preserve an observer. */
+	lf_check(fuzz, mdb_cursor_open(txn, dbi, &observer),
+	    "promotion observer open");
+	key = lf_key(7, keybuf);
+	lf_encode_value(fuzz, 5, encoded.bytes);
+	data.mv_size = fuzz->width;
+	data.mv_data = encoded.bytes;
+	lf_check(fuzz, mdb_cursor_get(observer, &key, &data, MDB_GET_BOTH),
+	    "promotion observer position");
+	lf_bulk_append_run(fuzz, writer, model, 7, 10, large_count, values);
+	lf_check(fuzz, mdb_cursor_count(observer, &duplicate_count),
+	    "promotion observer count");
+	if ((size_t)duplicate_count != model->counts[7])
+		lf_fail(fuzz, "promotion observer count mismatch");
+	current_key.mv_size = current_data.mv_size = 0;
+	current_key.mv_data = current_data.mv_data = NULL;
+	lf_check(fuzz, mdb_cursor_get(observer, &current_key, &current_data,
+	    MDB_GET_CURRENT), "promotion observer current");
+	lf_expect_value(fuzz, &current_data, 5, "promotion observer stable");
+	mdb_cursor_close(observer);
+	observer = NULL;
+
+	/* Promote a direct value to a tree in one step. */
+	key = lf_key(1, keybuf);
+	lf_encode_value(fuzz, 0, encoded.bytes);
+	data.mv_size = fuzz->width;
+	data.mv_data = encoded.bytes;
+	lf_check(fuzz, mdb_cursor_put(writer, &key, &data, MDB_APPENDDUP),
+	    "focused direct seed");
+	lf_model_add(fuzz, model, 1, 0);
+	lf_bulk_append_run(fuzz, writer, model, 1, 1, large_count, values);
+
+	/* Recreate another key directly as a real duplicate tree. */
+	key = lf_key(6, keybuf);
+	lf_check(fuzz, mdb_del(txn, dbi, &key, NULL),
+	    "focused clear before new tree");
+	lf_model_clear_key(model, 6);
+	lf_bulk_append_run(fuzz, writer, model, 6, 0, large_count, values);
+
+	/* Append to a tree which predated this transaction. */
+	lf_bulk_append_run(fuzz, writer, model, 0, 40000,
+	    tree_append_count, values);
+
+	mdb_cursor_close(writer);
+	lf_check(fuzz, mdb_txn_commit(txn), "focused transaction commit");
+	free(values);
+}
+
+static void
 lf_run_case(uint64_t base_seed, size_t operations, size_t case_index,
 	const LFCase *test_case, int trace)
 {
@@ -1195,6 +1389,7 @@ lf_run_case(uint64_t base_seed, size_t operations, size_t case_index,
 	lf_check(&fuzz, mdb_txn_commit(txn), "create transaction commit");
 
 	lf_seed_database(&fuzz, env, dbi, &committed);
+	lf_test_bulk_transitions(&fuzz, env, dbi, &committed);
 	lf_verify_env(&fuzz, env, dbi, &committed, 1);
 
 	while (completed < operations) {

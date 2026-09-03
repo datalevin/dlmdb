@@ -2100,6 +2100,104 @@ test_random_access_plain(MDB_env *env)
 }
 
 static void
+encode_split_sizing_key(uint32_t value, unsigned char *out, size_t size)
+{
+	out[0] = (unsigned char)(value >> 24);
+	out[1] = (unsigned char)(value >> 16);
+	out[2] = (unsigned char)(value >> 8);
+	out[3] = (unsigned char)value;
+	for (size_t i = 4; i < size; ++i)
+		out[i] = (unsigned char)(value + i * 31);
+}
+
+static void
+run_page_split_sizing_case(MDB_env *env, const char *name,
+	uint32_t count, unsigned int random_state, size_t data_size,
+	unsigned int min_depth)
+{
+	const size_t long_key_size = 495;
+	const size_t short_key_size = 5;
+	uint32_t *order = malloc((size_t)count * sizeof(*order));
+	MDB_txn *txn;
+	MDB_dbi dbi;
+	unsigned char data_buf[2] = {0, 1};
+	uint64_t total;
+	MDB_stat stat;
+
+	if (!order) {
+		fprintf(stderr, "%s: failed to allocate insertion order\n", name);
+		exit(EXIT_FAILURE);
+	}
+	for (uint32_t i = 0; i < count; ++i)
+		order[i] = i;
+	for (uint32_t i = count; i > 1; --i) {
+		uint32_t j = next_rand(&random_state) % i;
+		uint32_t tmp = order[i - 1];
+		order[i - 1] = order[j];
+		order[j] = tmp;
+	}
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split sizing begin");
+	CHECK(mdb_dbi_open(txn, name, MDB_CREATE | MDB_COUNTED, &dbi),
+	    "split sizing open");
+	for (uint32_t i = 0; i < count; ++i) {
+		unsigned char key_buf[495];
+		uint32_t value = order[i];
+		size_t key_size = value < count / 2
+		    ? long_key_size : short_key_size;
+		MDB_val key = {key_size, key_buf};
+		MDB_val data = {data_size, data_buf};
+		int rc;
+
+		encode_split_sizing_key(value, key_buf, key_size);
+		rc = mdb_put(txn, dbi, &key, &data, 0);
+		if (rc != MDB_SUCCESS) {
+			fprintf(stderr,
+			    "%s: insertion %u, key %u: %s\n",
+			    name, i, value, mdb_strerror(rc));
+			exit(EXIT_FAILURE);
+		}
+		if ((i + 1) % 2048 == 0 && i + 1 < count) {
+			CHECK(mdb_txn_commit(txn), "split sizing batch commit");
+			CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+			    "split sizing batch begin");
+		}
+	}
+	free(order);
+	CHECK(mdb_txn_commit(txn), "split sizing commit");
+
+	CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+	    "split sizing read begin");
+	CHECK(mdb_count_all(txn, dbi, 0, &total), "split sizing count");
+	expect_eq(total, count, "split sizing total");
+	CHECK(mdb_stat(txn, dbi, &stat), "split sizing stat");
+	if (stat.ms_depth < min_depth) {
+		fprintf(stderr, "%s: expected depth >= %u, got %u\n",
+		    name, min_depth, stat.ms_depth);
+		exit(EXIT_FAILURE);
+	}
+	mdb_txn_abort(txn);
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "split sizing drop begin");
+	CHECK(mdb_drop(txn, dbi, 1), "split sizing drop");
+	CHECK(mdb_txn_commit(txn), "split sizing drop commit");
+	mdb_dbi_close(env, dbi);
+}
+
+static void
+test_page_split_sizing(MDB_env *env)
+{
+	/* Odd keys and data require independent padding in leaf nodes. */
+	run_page_split_sizing_case(env, "split_sizing_leaf", 96, 2, 1, 2);
+
+	/* Even data makes leaf sizing exact, isolating the uint64_t stored in
+	 * every MDB_COUNTED branch node. The workload must reach depth three so
+	 * that a populated counted branch page is itself split.
+	 */
+	run_page_split_sizing_case(env, "split_sizing_branch", 3072, 1, 2, 3);
+}
+
+static void
 test_random_insert_parent_split_rank(MDB_env *env)
 {
     /* Match the Java shuffle and encoded keys from the Datalevin reproducer. */
@@ -4567,6 +4665,7 @@ main(void)
     test_count_all_dupsort(env);
     test_count_all_persistence();
     test_random_access_plain(env);
+    test_page_split_sizing(env);
     test_random_insert_parent_split_rank(env);
     test_random_access_plain_binary_prefix(env);
     test_rank_sampling_plain_stride(env);

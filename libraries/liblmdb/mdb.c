@@ -706,7 +706,7 @@ static txnid_t mdb_debug_start;
 #define MDB_MAGIC	 0xBEEFC0DE
 
 	/**	The version number for a database's datafile format. */
-#define MDB_DATA_VERSION	 ((MDB_DEVEL) ? 999 : 1)
+#define MDB_DATA_VERSION	 ((MDB_DEVEL) ? 999 : 2)
 	/**	The version number for a database's lockfile format. */
 #define MDB_LOCK_VERSION	 ((MDB_DEVEL) ? 999 : 2)
 	/** Number of bits representing #MDB_LOCK_VERSION in #MDB_LOCK_FORMAT.
@@ -13604,7 +13604,7 @@ mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key)
 		/* sz -= key->size - sizeof(pgno_t); */
 	}
 
-	return sz + sizeof(indx_t);
+	return EVEN(sz + sizeof(indx_t));
 }
 
 /** Add a node to the page pointed to by the cursor.
@@ -15982,7 +15982,6 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 					}
 				} else
 					nsize = mdb_branch_size(env, mp, newkey);
-				nsize = EVEN(nsize);
 
 			/* grab a page to hold a temporary copy */
 			copy = mdb_page_malloc(mc->mc_txn, 1);
@@ -16035,14 +16034,14 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 							node = NULL;
 						} else {
 							node = (MDB_node *)((char *)mp + copy->mp_ptrs[i] + PAGEBASE);
-							psize += NODESIZE + NODEKSZ(node) + sizeof(indx_t);
+							psize += NODESIZE + EVEN(NODEKSZ(node)) + sizeof(indx_t);
 							if (IS_LEAF(mp)) {
 								if (F_ISSET(node->mn_flags, F_BIGDATA))
 									psize += sizeof(pgno_t);
 								else
-									psize += NODEDSZ(node);
-							}
-							psize = EVEN(psize);
+									psize += EVEN(NODEDSZ(node));
+							} else if (IS_COUNTED(mp))
+								psize += sizeof(uint64_t);
 						}
 						if (psize > pmax || i == k-j) {
 							split_indx = i + (j<0);

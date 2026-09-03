@@ -227,7 +227,7 @@ typedef int mdb_filehandle_t;
 /** Library major version */
 #define MDB_VERSION_MAJOR	1
 /** Library minor version */
-#define MDB_VERSION_MINOR	0
+#define MDB_VERSION_MINOR	1
 /** Library patch version */
 #define MDB_VERSION_PATCH	0
 
@@ -239,7 +239,7 @@ typedef int mdb_filehandle_t;
 	MDB_VERINT(MDB_VERSION_MAJOR,MDB_VERSION_MINOR,MDB_VERSION_PATCH)
 
 /** The release date of this library version */
-#define MDB_VERSION_DATE	"October 26, 2025"
+#define MDB_VERSION_DATE	"September 3, 2026"
 
 /** A stringifier for the version info */
 #define MDB_VERSTR(a,b,c,d)	"DLMDB " #a "." #b "." #c ": (" d ")"

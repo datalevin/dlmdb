@@ -4290,6 +4290,101 @@ encode_u64_be(unsigned char out[8], uint64_t value)
 }
 
 static void
+test_dupsort_zero_length_values(MDB_env *env)
+{
+    MDB_txn *txn;
+    MDB_dbi plain, dupsort, counted, dupfixed;
+    MDB_cursor *cursor;
+    unsigned char empty_byte = 0;
+    unsigned char value_a = 'a';
+    unsigned char value_b = 'b';
+    MDB_val empty = {0, &empty_byte};
+    MDB_val key = {strlen("zero"), "zero"};
+    MDB_val data_a = {sizeof(value_a), &value_a};
+    MDB_val data_b = {sizeof(value_b), &value_b};
+    MDB_val found = {0, NULL};
+    MDB_val multiple[2] = {
+        {0, &empty_byte},
+        {2, NULL}
+    };
+    mdb_size_t count;
+    int rc;
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+          "zero dupsort begin");
+    CHECK(mdb_dbi_open(txn, "zero_plain", MDB_CREATE, &plain),
+          "zero plain open");
+    CHECK(mdb_dbi_open(txn, "zero_dupsort", MDB_CREATE | MDB_DUPSORT,
+                       &dupsort),
+          "zero dupsort open");
+    CHECK(mdb_dbi_open(txn, "zero_counted_dupsort",
+                       MDB_CREATE | MDB_DUPSORT | MDB_COUNTED |
+                       MDB_PREFIX_COMPRESSION, &counted),
+          "zero counted dupsort open");
+    CHECK(mdb_dbi_open(txn, "zero_dupfixed",
+                       MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED, &dupfixed),
+          "zero dupfixed open");
+
+    CHECK(mdb_put(txn, plain, &key, &empty, 0),
+          "zero plain put");
+    CHECK(mdb_get(txn, plain, &key, &found),
+          "zero plain get");
+    expect_eq(found.mv_size, 0, "zero plain value size");
+
+    rc = mdb_put(txn, dupsort, &key, &empty, 0);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero dupsort put");
+    CHECK(mdb_put(txn, dupsort, &key, &data_a, 0),
+          "zero dupsort valid put");
+    rc = mdb_put(txn, dupsort, &key, &empty, MDB_NODUPDATA);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero dupsort nodupdata");
+
+    CHECK(mdb_cursor_open(txn, dupsort, &cursor),
+          "zero dupsort cursor open");
+    CHECK(mdb_cursor_get(cursor, &key, &found, MDB_SET_KEY),
+          "zero dupsort cursor seek");
+    rc = mdb_cursor_put(cursor, &key, &empty, MDB_CURRENT);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero dupsort current");
+    rc = mdb_cursor_put(cursor, &key, &empty, MDB_APPENDDUP);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero dupsort appenddup");
+    CHECK(mdb_cursor_put(cursor, &key, &data_b, MDB_APPENDDUP),
+          "zero dupsort valid appenddup");
+    key.mv_size = strlen("zero");
+    key.mv_data = "zero";
+    CHECK(mdb_cursor_get(cursor, &key, &found, MDB_SET_KEY),
+          "zero dupsort cursor reseek");
+    CHECK(mdb_cursor_count(cursor, &count),
+          "zero dupsort cursor count");
+    expect_eq(count, 2, "zero dupsort valid count");
+    mdb_cursor_close(cursor);
+
+    rc = mdb_put(txn, counted, &key, &empty, 0);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero counted dupsort put");
+    CHECK(mdb_put(txn, counted, &key, &data_a, 0),
+          "zero counted dupsort valid put");
+
+    CHECK(mdb_cursor_open(txn, dupfixed, &cursor),
+          "zero dupfixed cursor open");
+    rc = mdb_cursor_put(cursor, &key, multiple,
+                        MDB_MULTIPLE | MDB_APPENDDUP);
+    expect_rc(rc, MDB_BAD_VALSIZE, "zero dupfixed multiple value");
+    expect_eq(multiple[1].mv_size, 0,
+              "zero dupfixed multiple processed");
+    CHECK(mdb_cursor_put(cursor, &key, &data_a, 0),
+          "zero dupfixed valid put");
+    mdb_cursor_close(cursor);
+
+    CHECK(mdb_drop(txn, plain, 1), "zero plain drop");
+    CHECK(mdb_drop(txn, dupsort, 1), "zero dupsort drop");
+    CHECK(mdb_drop(txn, counted, 1), "zero counted dupsort drop");
+    CHECK(mdb_drop(txn, dupfixed, 1), "zero dupfixed drop");
+    CHECK(mdb_txn_commit(txn), "zero dupsort commit");
+    mdb_dbi_close(env, plain);
+    mdb_dbi_close(env, dupsort);
+    mdb_dbi_close(env, counted);
+    mdb_dbi_close(env, dupfixed);
+}
+
+static void
 test_counted_dupfixed_multiple(MDB_env *env)
 {
     enum {
@@ -4658,6 +4753,7 @@ main(void)
     test_range_count_values(env);
     test_range_count_keys_dupsort(env);
     test_range_count_values_raw(env);
+    test_dupsort_zero_length_values(env);
     test_counted_dupfixed_multiple(env);
     test_dupfixed_multiple_wide_count(env);
     test_range_count_values_many_env();

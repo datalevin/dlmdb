@@ -4717,6 +4717,90 @@ test_dupfixed_multiple_wide_count(MDB_env *env)
     mdb_dbi_close(env, dbi);
 }
 
+static void
+encode_dupsort_stat_value(uint32_t value, unsigned char *out, size_t size)
+{
+	out[0] = (unsigned char)(value >> 24);
+	out[1] = (unsigned char)(value >> 16);
+	out[2] = (unsigned char)(value >> 8);
+	out[3] = (unsigned char)value;
+	for (size_t i = 4; i < size; ++i)
+		out[i] = (unsigned char)(value + i * 17);
+}
+
+static void
+run_dupsort_stat_case(MDB_env *env, const char *name, unsigned int flags)
+{
+	const uint32_t value_count = 4096;
+	const uint32_t values_left = 32;
+	const size_t value_size = (flags & MDB_DUPFIXED) ? 8 : 24;
+	MDB_val key = {strlen("only-key"), "only-key"};
+	MDB_stat grown, trimmed, reopened;
+	MDB_txn *txn;
+	MDB_dbi dbi;
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dupsort stat begin");
+	CHECK(mdb_dbi_open(txn, name, MDB_CREATE | MDB_DUPSORT | flags, &dbi),
+	    "dupsort stat open");
+	for (uint32_t i = 0; i < value_count; ++i) {
+		unsigned char value_buf[24];
+		MDB_val data = {value_size, value_buf};
+
+		encode_dupsort_stat_value(i, value_buf, value_size);
+		CHECK(mdb_put(txn, dbi, &key, &data, 0), "dupsort stat put");
+	}
+	CHECK(mdb_stat(txn, dbi, &grown), "dupsort stat grown");
+	expect_eq(grown.ms_entries, value_count, "dupsort stat grown entries");
+	if (!grown.ms_branch_pages || grown.ms_leaf_pages <= 2) {
+		fprintf(stderr,
+		    "%s: duplicate-tree pages missing from statistics "
+		    "(branch=%" PRIu64 ", leaf=%" PRIu64 ")\n",
+		    name, (uint64_t)grown.ms_branch_pages,
+		    (uint64_t)grown.ms_leaf_pages);
+		exit(EXIT_FAILURE);
+	}
+
+	for (uint32_t i = 0; i < value_count - values_left; ++i) {
+		unsigned char value_buf[24];
+		MDB_val data = {value_size, value_buf};
+
+		encode_dupsort_stat_value(i, value_buf, value_size);
+		CHECK(mdb_del(txn, dbi, &key, &data), "dupsort stat delete");
+	}
+	CHECK(mdb_stat(txn, dbi, &trimmed), "dupsort stat trimmed");
+	expect_eq(trimmed.ms_entries, values_left,
+	    "dupsort stat trimmed entries");
+	expect_eq(trimmed.ms_branch_pages, 0,
+	    "dupsort stat trimmed branch pages");
+	expect_eq(trimmed.ms_leaf_pages, 2,
+	    "dupsort stat outer and duplicate leaf pages");
+	CHECK(mdb_txn_commit(txn), "dupsort stat commit");
+
+	CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+	    "dupsort stat reopen begin");
+	CHECK(mdb_stat(txn, dbi, &reopened), "dupsort stat reopened");
+	expect_eq(reopened.ms_entries, trimmed.ms_entries,
+	    "dupsort stat reopened entries");
+	expect_eq(reopened.ms_branch_pages, trimmed.ms_branch_pages,
+	    "dupsort stat reopened branch pages");
+	expect_eq(reopened.ms_leaf_pages, trimmed.ms_leaf_pages,
+	    "dupsort stat reopened leaf pages");
+	mdb_txn_abort(txn);
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dupsort stat drop begin");
+	CHECK(mdb_drop(txn, dbi, 1), "dupsort stat drop");
+	CHECK(mdb_txn_commit(txn), "dupsort stat drop commit");
+	mdb_dbi_close(env, dbi);
+}
+
+static void
+test_dupsort_page_statistics(MDB_env *env)
+{
+	run_dupsort_stat_case(env, "dupsort_stat", 0);
+	run_dupsort_stat_case(env, "dupsort_stat_extensions",
+	    MDB_COUNTED | MDB_DUPFIXED | MDB_PREFIX_COMPRESSION);
+}
+
 int
 main(void)
 {
@@ -4756,6 +4840,7 @@ main(void)
     test_dupsort_zero_length_values(env);
     test_counted_dupfixed_multiple(env);
     test_dupfixed_multiple_wide_count(env);
+    test_dupsort_page_statistics(env);
     test_range_count_values_many_env();
     test_count_all_plain(env);
     test_count_all_dupsort(env);

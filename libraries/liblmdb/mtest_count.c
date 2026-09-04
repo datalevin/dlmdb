@@ -4801,6 +4801,113 @@ test_dupsort_page_statistics(MDB_env *env)
 	    MDB_COUNTED | MDB_DUPFIXED | MDB_PREFIX_COMPRESSION);
 }
 
+static void
+test_main_dbi_drop_reclaims_named_pages(void)
+{
+	const char *path = "./testdb_count_main_drop";
+	const size_t payload_size = 600 * 1024;
+	unsigned char *payload = malloc(payload_size);
+	MDB_val key = {strlen("payload"), "payload"};
+	MDB_val data = {payload_size, payload};
+	MDB_envinfo before, after;
+	MDB_env *env;
+	MDB_txn *txn;
+	MDB_dbi main_dbi, named_dbi, dup_dbi;
+	int rc;
+
+	if (!payload) {
+		fprintf(stderr, "main DBI drop payload allocation failed\n");
+		exit(EXIT_FAILURE);
+	}
+	memset(payload, 0xa5, payload_size);
+	cleanup_env_dir(path);
+	if (mkdir(path, 0775) && errno != EEXIST)
+		fatal_errno("main DBI drop mkdir");
+
+	CHECK(mdb_env_create(&env), "main DBI drop env create");
+	CHECK(mdb_env_set_mapsize(env, 1024 * 1024),
+	    "main DBI drop mapsize");
+	CHECK(mdb_env_set_maxdbs(env, 4), "main DBI drop maxdbs");
+	CHECK(mdb_env_open(env, path, MDB_NOLOCK, 0664),
+	    "main DBI drop env open");
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "main DBI drop fill begin");
+	CHECK(mdb_dbi_open(txn, NULL,
+	    MDB_COUNTED | MDB_PREFIX_COMPRESSION, &main_dbi),
+	    "main DBI drop main open");
+	CHECK(mdb_dbi_open(txn, "named-overflow",
+	    MDB_CREATE | MDB_COUNTED | MDB_PREFIX_COMPRESSION, &named_dbi),
+	    "main DBI drop named open");
+	CHECK(mdb_put(txn, named_dbi, &key, &data, 0),
+	    "main DBI drop named put");
+	CHECK(mdb_dbi_open(txn, "named-sorted-dups",
+	    MDB_CREATE | MDB_COUNTED | MDB_DUPSORT | MDB_DUPFIXED |
+	    MDB_PREFIX_COMPRESSION, &dup_dbi),
+	    "main DBI drop dup open");
+	{
+		MDB_val dup_key = {strlen("dups"), "dups"};
+
+		for (uint32_t i = 0; i < 2048; ++i) {
+			unsigned char value_buf[8];
+			MDB_val value = {sizeof(value_buf), value_buf};
+
+			encode_dupsort_stat_value(i, value_buf, sizeof(value_buf));
+			CHECK(mdb_put(txn, dup_dbi, &dup_key, &value, 0),
+			    "main DBI drop dup put");
+		}
+	}
+	CHECK(mdb_txn_commit(txn), "main DBI drop fill commit");
+	CHECK(mdb_env_info(env, &before), "main DBI drop info before");
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+	    "main DBI drop busy begin");
+	rc = mdb_drop(txn, main_dbi, 0);
+	expect_rc(rc, MDB_DBIS_BUSY, "main DBI drop busy named handle");
+	mdb_txn_abort(txn);
+
+	mdb_dbi_close(env, named_dbi);
+	mdb_dbi_close(env, dup_dbi);
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "main DBI drop begin");
+	CHECK(mdb_drop(txn, main_dbi, 0), "main DBI drop");
+	CHECK(mdb_txn_commit(txn), "main DBI drop commit");
+
+	CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn),
+	    "main DBI drop verify begin");
+	rc = mdb_dbi_open(txn, "named-overflow", 0, &named_dbi);
+	expect_rc(rc, MDB_NOTFOUND, "main DBI drop named removed");
+	rc = mdb_dbi_open(txn, "named-sorted-dups", 0, &dup_dbi);
+	expect_rc(rc, MDB_NOTFOUND, "main DBI drop dup removed");
+	mdb_txn_abort(txn);
+
+	/* Free-list records become reusable after the following write txn. */
+	{
+		MDB_val seed = {1, "x"};
+
+		CHECK(mdb_txn_begin(env, NULL, 0, &txn),
+		    "main DBI drop advance begin");
+		CHECK(mdb_put(txn, main_dbi, &key, &seed, 0),
+		    "main DBI drop advance put");
+		CHECK(mdb_txn_commit(txn), "main DBI drop advance commit");
+	}
+
+	CHECK(mdb_txn_begin(env, NULL, 0, &txn), "main DBI drop reuse begin");
+	CHECK(mdb_put(txn, main_dbi, &key, &data, 0),
+	    "main DBI drop reuse pages");
+	CHECK(mdb_txn_commit(txn), "main DBI drop reuse commit");
+	CHECK(mdb_env_info(env, &after), "main DBI drop info after");
+	if (after.me_last_pgno > before.me_last_pgno + 8) {
+		fprintf(stderr,
+		    "main DBI drop failed to reuse pages: before=%" PRIu64
+		    ", after=%" PRIu64 "\n",
+		    (uint64_t)before.me_last_pgno, (uint64_t)after.me_last_pgno);
+		exit(EXIT_FAILURE);
+	}
+
+	mdb_env_close(env);
+	cleanup_env_dir(path);
+	free(payload);
+}
+
 int
 main(void)
 {
@@ -4841,6 +4948,7 @@ main(void)
     test_counted_dupfixed_multiple(env);
     test_dupfixed_multiple_wide_count(env);
     test_dupsort_page_statistics(env);
+    test_main_dbi_drop_reclaims_named_pages();
     test_range_count_values_many_env();
     test_count_all_plain(env);
     test_count_all_dupsort(env);

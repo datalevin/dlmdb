@@ -495,8 +495,10 @@ typedef enum MDB_cursor_op {
 #define MDB_BAD_DBI		(-30780)
 	/** Unexpected problem - txn should abort */
 #define MDB_PROBLEM		(-30779)
+	/** Can't drop main DBI while other DBIs are open */
+#define MDB_DBIS_BUSY	(-30778)
 	/** The last defined error code */
-#define MDB_LAST_ERRCODE	MDB_PROBLEM
+#define MDB_LAST_ERRCODE	MDB_DBIS_BUSY
 /** @} */
 
 /** @brief Statistics for a database in the environment */

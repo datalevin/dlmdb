@@ -5297,6 +5297,7 @@ static char *const mdb_errstr[] = {
 	"MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size",
 	"MDB_BAD_DBI: The specified DBI handle was closed/changed unexpectedly",
 	"MDB_PROBLEM: Unexpected problem - txn should abort",
+	"MDB_DBIS_BUSY: Can't drop main DBI while other DBIs are open",
 };
 
 char *
@@ -18225,11 +18226,69 @@ int mdb_drop(MDB_txn *txn, MDB_dbi dbi, int del)
 	if (TXN_DBI_CHANGED(txn, dbi))
 		return MDB_BAD_DBI;
 
+	MDB_TRACE(("%u, %d", dbi, del));
+
+	/* Dropping the main DBI must check if named DBs were in use.
+	 * Can't drop it if any other DBIs are still open.
+	 */
+	if (dbi == MAIN_DBI) {
+		MDB_dbi i;
+		MDB_val key, data;
+		MDB_node *node;
+
+		/* Cannot mix named databases with some mainDB flags. If these
+		 * are set, there are no named DBs.
+		 */
+		if (txn->mt_dbs[MAIN_DBI].md_flags & (MDB_DUPSORT|MDB_INTEGERKEY))
+			goto plain;
+
+		for (i = CORE_DBS; i<txn->mt_numdbs; i++) {
+			if (txn->mt_dbflags[i] & DB_VALID)
+				return MDB_DBIS_BUSY;
+		}
+
+		/* Are there any named DBs? We can't rely on env->me_maxdbs
+		 * being set. We have to check if a node is actually a DB.
+		 * When named DBs are in use, the mainDB must not contain any
+		 * other user data. So all records in the mainDB should be
+		 * DB records, so we only need to check the first one.
+		 */
+		rc = mdb_cursor_open(txn, dbi, &mc);
+		if (rc)
+			return rc;
+		rc = mdb_cursor_first(mc, &key, &data);
+		if (rc) {
+			mdb_cursor_close(mc);
+			if (rc == MDB_NOTFOUND) /* already empty */
+				return MDB_SUCCESS;
+			return rc;
+		}
+		node = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
+		if ((node->mn_flags & (F_DUPDATA|F_SUBDATA)) != F_SUBDATA) {
+			/* it's not a named DB. just do a normal drop. */
+			goto plain2;
+		}
+		do {
+			rc = mdb_dbi_open(txn, key.mv_data, 0, &i);
+			if (rc) {
+				if (rc != MDB_NOTFOUND)
+					goto leave;
+				goto plain2;
+			}
+			rc = mdb_drop(txn, i, 1);
+			if (rc)
+				goto leave;
+			rc = mdb_cursor_first(mc, &key, &data);
+		} while (!rc);
+		goto plain2;
+	}
+
+plain:
 	rc = mdb_cursor_open(txn, dbi, &mc);
 	if (rc)
 		return rc;
 
-	MDB_TRACE(("%u, %d", dbi, del));
+plain2:
 	rc = mdb_drop0(mc, mc->mc_db->md_flags & MDB_DUPSORT);
 	/* Invalidate the dropped DB's cursors */
 	for (m2 = txn->mt_cursors[dbi]; m2; m2 = m2->mc_next)

@@ -6421,8 +6421,10 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 #if defined(_WIN32) && !defined(MDB_VL32)
 	if (!(env->me_flags & MDB_RDONLY)) {
 		void *p;
+		SIZE_T sz = env->me_psize;
+		sz *= num;
 		p = (MDB_page *)(env->me_map + env->me_psize * pgno);
-		p = VirtualAlloc(p, env->me_psize * num, MEM_COMMIT,
+		p = VirtualAlloc(p, sz, MEM_COMMIT,
 			(env->me_flags & MDB_WRITEMAP) ? PAGE_READWRITE:
 			PAGE_READONLY);
 		if (!p) {
@@ -7538,14 +7540,18 @@ mdb_page_flush(MDB_txn *txn, int keep)
 	MDB_page	*dp = NULL;
 #ifdef _WIN32
 	OVERLAPPED	*ov = env->ov;
-	MDB_page	*wdp;
-	int async_i = 0;
+	char		*wdp;
+	size_t		w2;
+	int async_i = 0, opages = 0;
 	HANDLE fd = (env->me_flags & MDB_NOSYNC) ? env->me_fd : env->me_ovfd;
 #else
 	struct iovec iov[MDB_COMMIT_PAGES];
 	HANDLE fd = env->me_fd;
 #endif
 	ssize_t		wsize = 0, wres;
+#ifndef _WIN32
+	ssize_t		wlen;
+#endif
 	MDB_OFF_T	wpos = 0, next_pos = 1; /* impossible pos, so pos != next_pos */
 	int			n = 0;
 
@@ -7572,9 +7578,17 @@ mdb_page_flush(MDB_txn *txn, int keep)
 	}
 
 #ifdef _WIN32
-	if (pagecount - keep >= env->ovs) {
+	/* Each chunk needs its own OVERLAPPED until all writes complete. */
+	for (i = keep; ++i <= pagecount; ) {
+		dp = dl[i].mptr;
+		if (IS_OVERFLOW(dp) && dp->mp_pages > MAX_WRITE / psize)
+			opages += (dp->mp_pages - 1) / (MAX_WRITE / psize);
+	}
+	i = keep;
+	if (pagecount - keep + opages >= env->ovs) {
 		/* ran out of room in ov array, and re-malloc, copy handles and free previous */
-		int ovs = (pagecount - keep) * 1.5; /* provide extra padding to reduce number of re-allocations */
+		/* provide extra padding to reduce number of re-allocations */
+		int ovs = (pagecount - keep) * 1.5 + opages;
 		int new_size = ovs * sizeof(OVERLAPPED);
 		ov = malloc(new_size);
 		if (ov == NULL)
@@ -7630,35 +7644,57 @@ retry_write:
 				/* Write previous page(s) */
 				DPRINTF(("committing page %"Z"u", pgno));
 #ifdef _WIN32
-				OVERLAPPED *this_ov = &ov[async_i];
-				/* Clear status, and keep hEvent, we reuse that */
-				this_ov->Internal = 0;
-				this_ov->Offset = wpos & 0xffffffff;
-				this_ov->OffsetHigh = wpos >> 16 >> 16;
-				if (!F_ISSET(env->me_flags, MDB_NOSYNC) && !this_ov->hEvent) {
-					HANDLE event = CreateEvent(NULL, FALSE, FALSE, NULL);
-					if (!event) {
+				do {
+					OVERLAPPED *this_ov;
+					w2 = wsize > MAX_WRITE ? MAX_WRITE : wsize;
+					mdb_tassert(txn, async_i < env->ovs);
+					this_ov = &ov[async_i];
+					/* Clear status, and keep hEvent, we reuse that */
+					this_ov->Internal = 0;
+					this_ov->Offset = wpos & 0xffffffff;
+					this_ov->OffsetHigh = wpos >> 16 >> 16;
+					if (!F_ISSET(env->me_flags, MDB_NOSYNC) &&
+						!this_ov->hEvent) {
+						HANDLE event = CreateEvent(NULL, FALSE, FALSE, NULL);
+						if (!event) {
+							rc = ErrCode();
+							DPRINTF(("CreateEvent: %s", strerror(rc)));
+							return rc;
+						}
+						this_ov->hEvent = event;
+					}
+					if (!WriteFile(fd, wdp, w2, NULL, this_ov)) {
 						rc = ErrCode();
-						DPRINTF(("CreateEvent: %s", strerror(rc)));
-						return rc;
+						if (rc != ERROR_IO_PENDING) {
+							DPRINTF(("WriteFile: %d", rc));
+							return rc;
+						}
 					}
-					this_ov->hEvent = event;
-				}
-				if (!WriteFile(fd, wdp, wsize, NULL, this_ov)) {
-					rc = ErrCode();
-					if (rc != ERROR_IO_PENDING) {
-						DPRINTF(("WriteFile: %d", rc));
-						return rc;
-					}
-				}
-				async_i++;
-#else
-#ifdef MDB_USE_PWRITEV
-				wres = pwritev(fd, iov, n, wpos);
+					wsize -= w2;
+					wpos += w2;
+					wdp += w2;
+					async_i++;
+				} while (wsize);
 #else
 				if (n == 1) {
+					while (wsize > MAX_WRITE) {
+						wlen = MAX_WRITE;
+						wres = pwrite(fd, iov[0].iov_base,
+							MAX_WRITE, wpos);
+						if (wres != wlen)
+							goto bad_write;
+						wsize -= MAX_WRITE;
+						wpos += MAX_WRITE;
+						iov[0].iov_base =
+							(char *)iov[0].iov_base + MAX_WRITE;
+					}
+					wlen = wsize;
 					wres = pwrite(fd, iov[0].iov_base, wsize, wpos);
 				} else {
+					wlen = wsize;
+#ifdef MDB_USE_PWRITEV
+					wres = pwritev(fd, iov, n, wpos);
+#else
 retry_seek:
 					if (lseek(fd, wpos, SEEK_SET) == -1) {
 						rc = ErrCode();
@@ -7668,9 +7704,10 @@ retry_seek:
 						return rc;
 					}
 					wres = writev(fd, iov, n);
-				}
 #endif
-				if (wres != wsize) {
+				}
+bad_write:
+				if (wres != wlen) {
 					if (wres < 0) {
 						rc = ErrCode();
 						if (rc == EINTR)
@@ -7690,7 +7727,7 @@ retry_seek:
 			wpos = pos;
 			wsize = 0;
 #ifdef _WIN32
-			wdp = dp;
+			wdp = (char *)dp;
 		}
 #else
 		}

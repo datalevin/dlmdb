@@ -1476,7 +1476,8 @@ main(int argc, char **argv)
 		{3, MDB_PREFIX_COMPRESSION, 0},
 		{8, 0, 0},
 		{31, MDB_PREFIX_COMPRESSION, 0},
-		{sizeof(mdb_size_t), MDB_INTEGERDUP, 1}
+		{sizeof(mdb_size_t), MDB_INTEGERDUP, 1},
+		{2, MDB_PREFIX_COMPRESSION, 0}
 	};
 	uint64_t seed = LF_DEFAULT_SEED;
 	size_t operations = LF_DEFAULT_OPS;

@@ -10153,7 +10153,9 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
 	cmp = mc->mc_dbx->md_cmp;
 	int prefix_enabled = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
 
-	if (IS_LEAF(mp) && prefix_enabled && nkeys > 0) {
+	/* LEAF2 stores packed values, not nodes or a prefix trunk. Its duplicate
+	 * DB can still inherit MDB_PREFIX_COMPRESSION from the parent. */
+	if (IS_LEAF(mp) && !IS_LEAF2(mp) && prefix_enabled && nkeys > 0) {
 		MDB_node *trunk_node = NODEPTR(mp, 0);
 		trunk.mv_size = trunk_node->mn_ksize;
 		trunk.mv_data = NODEKEY(mp, trunk_node);
@@ -11937,8 +11939,14 @@ mdb_cursor_touch(MDB_cursor *mc)
 }
 
 static void
-mdb_subdb_adjust(MDB_cursor *mc, MDB_db *old, MDB_db *new)
+mdb_subdb_adjust(MDB_cursor *mc, const void *old_data, const MDB_db *new)
 {
+	/* NODEDATA is only two-byte aligned. Copy persisted metadata before
+	 * accessing MDB_db's naturally aligned fields. */
+	MDB_db old_db;
+	const MDB_db *old = &old_db;
+	memcpy(&old_db, old_data, sizeof(old_db));
+
 	if (new->md_branch_pages >= old->md_branch_pages)
 		mc->mc_db->md_branch_pages +=
 		    new->md_branch_pages - old->md_branch_pages;

@@ -1730,6 +1730,122 @@ test_prefix_overflow_trunk_reencode_regression(void)
 	cleanup_env_dir(dir);
 }
 
+/* Moving an existing overflow node to the front of a compressed leaf changes
+ * its trunk key. Rebuilding that leaf must retain the existing overflow page
+ * number, even though mdb_node_add did not allocate an overflow page.
+ */
+static void
+overflow_rebalance_verify(MDB_env *env, MDB_dbi dbi, unsigned int remaining,
+    unsigned char *expected, size_t value_size)
+{
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_stat stat;
+	MDB_val key = {0, NULL}, data = {0, NULL};
+	unsigned char keybuf[128];
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_entries != remaining ||
+	    stat.ms_overflow_pages != (value_size / stat.ms_psize + 1) * remaining) {
+		fprintf(stderr, "overflow rebalance: incorrect page/entry counts\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	for (unsigned int i = 0; i < remaining; ++i) {
+		memset(keybuf, i, sizeof(keybuf));
+		memset(expected, i, value_size);
+		if (rc != MDB_SUCCESS || key.mv_size != sizeof(keybuf) ||
+		    memcmp(key.mv_data, keybuf, sizeof(keybuf)) ||
+		    data.mv_size != value_size ||
+		    memcmp(data.mv_data, expected, value_size)) {
+			fprintf(stderr, "overflow rebalance: changed surviving row %u\n", i);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "overflow rebalance: unexpected remaining row\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static void
+test_prefix_overflow_rebalance_regression(void)
+{
+	static const char *dir = "testdb_prefix_overflow_rebalance";
+	static const char *name = "overflow-rebalance";
+
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		unsigned char keybuf[128];
+		MDB_val key = {sizeof(keybuf), keybuf};
+		unsigned int flags = MDB_PREFIX_COMPRESSION |
+		    (counted ? MDB_COUNTED : 0);
+
+		CHECK_CALL(mdb_env_stat(env, &stat));
+		size_t value_size = (size_t)stat.ms_psize * 2;
+		unsigned char *value = malloc(value_size);
+		if (!value)
+			die_errno("malloc overflow rebalance value");
+		MDB_val data = {value_size, value};
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, name, MDB_CREATE | flags, &dbi));
+		for (unsigned int i = 0; i < 256; ++i) {
+			memset(keybuf, i, sizeof(keybuf));
+			memset(value, i, value_size);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_depth < 2) {
+			fprintf(stderr, "overflow rebalance: expected multiple leaves\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		/* Exercise rollback after repeatedly borrowing and merging pages. */
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		for (int i = 255; i >= 0; --i) {
+			memset(keybuf, i, sizeof(keybuf));
+			CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		}
+		mdb_txn_abort(txn);
+		overflow_rebalance_verify(env, dbi, 256, value, value_size);
+
+		/* Descending deletes borrow an overflow node from the left sibling
+		 * into slot zero of the remaining right leaf, replacing its trunk.
+		 * Check every surviving byte after each committed deletion.
+		 */
+		for (int i = 255; i >= 0; --i) {
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+			memset(keybuf, i, sizeof(keybuf));
+			CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+			CHECK_CALL(mdb_txn_commit(txn));
+			if (i == 128) {
+				mdb_env_close(env);
+				CHECK_CALL(mdb_env_create(&env));
+				CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+				CHECK_CALL(mdb_env_set_mapsize(env, 64UL * 1024 * 1024));
+				CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+				CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+				CHECK_CALL(mdb_dbi_open(txn, name, flags, &dbi));
+				CHECK_CALL(mdb_txn_commit(txn));
+			}
+			overflow_rebalance_verify(env, dbi, i, value, value_size);
+		}
+		free(value);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
 #define PSS_N_SHORT 27
 #define PSS_N_LONG  83
 #define PSS_N_TOTAL (PSS_N_SHORT + PSS_N_LONG)
@@ -4262,6 +4378,7 @@ main(void)
 	test_prefix_dupsort_get_both_range();
 	test_prefix_leaf_splits();
 	test_prefix_overflow_trunk_reencode_regression();
+	test_prefix_overflow_rebalance_regression();
 	test_prefix_split_stride_reverse_regression();
 	test_prefix_split_trunk_reencode_regression();
 	test_prefix_alternating_prefixes();

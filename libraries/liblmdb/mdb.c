@@ -4111,10 +4111,12 @@ mdb_leaf_rebuild_after_trunk_insert(MDB_cursor *mc, MDB_page *mp,
 
 	insert_entry->data_size = new_data ? new_data->mv_size : 0;
 	if (F_ISSET(new_flags, F_BIGDATA)) {
-		if (!ofp)
-			return MDB_PROBLEM;
+		/* A moved node already stores an overflow page number in new_data.
+		 * Only newly spilled values have an allocated overflow page here.
+		 */
 		insert_entry->data_payload = sizeof(pgno_t);
-		insert_entry->data_ptr = (unsigned char *)&ofp->mp_pgno;
+		insert_entry->data_ptr = ofp ? (unsigned char *)&ofp->mp_pgno :
+		    (unsigned char *)new_data->mv_data;
 	} else {
 		insert_entry->data_payload = new_data ? new_data->mv_size : 0;
 		if (is_reserve)

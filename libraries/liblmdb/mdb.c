@@ -1647,6 +1647,7 @@ typedef struct MDB_prefix_stride_cache {
 	MDB_prefix_stride_entry	*entries;
 	unsigned int			count;
 	unsigned int			capacity;
+	unsigned int			generation; /**< incremented on scratch reset */
 } MDB_prefix_stride_cache;
 
 typedef struct MDB_prefix_scratch {
@@ -2428,6 +2429,33 @@ typedef struct MDB_ntxn {
 #define TXN_DBI_CHANGED(txn, dbi) \
 	((txn)->mt_dbiseqs[dbi] != (txn)->mt_env->me_dbiseqs[dbi])
 
+/** assert(3) variant in cursor context */
+#define mdb_cassert(mc, expr)	mdb_assert0((mc)->mc_txn->mt_env, expr, #expr)
+/** assert(3) variant in transaction context */
+#define mdb_tassert(txn, expr)	mdb_assert0((txn)->mt_env, expr, #expr)
+/** assert(3) variant in environment context */
+#define mdb_eassert(env, expr)	mdb_assert0(env, expr, #expr)
+
+#ifndef NDEBUG
+# define mdb_assert0(env, expr, expr_txt) ((expr) ? (void)0 : \
+		mdb_assert_fail(env, expr_txt, mdb_func_, __FILE__, __LINE__))
+
+static void ESECT
+mdb_assert_fail(MDB_env *env, const char *expr_txt,
+	const char *func, const char *file, int line)
+{
+	char buf[400];
+	sprintf(buf, "%.100s:%d: Assertion '%.200s' failed in %.40s()",
+		file, line, expr_txt, func);
+	if (env->me_assert_func)
+		env->me_assert_func(env, buf);
+	fprintf(stderr, "%s\n", buf);
+	abort();
+}
+#else
+# define mdb_assert0(env, expr, expr_txt) ((void) 0)
+#endif /* NDEBUG */
+
 static int  mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp);
 static int  mdb_page_new(MDB_cursor *mc, uint32_t flags, int num, MDB_page **mp);
 static int  mdb_page_touch(MDB_cursor *mc);
@@ -2826,6 +2854,7 @@ mdb_prefix_stride_cache_clear(MDB_prefix_stride_cache *cache)
 	cache->entries = NULL;
 	cache->count = 0;
 	cache->capacity = 0;
+	cache->generation = 0;
 }
 
 static unsigned int
@@ -2891,6 +2920,10 @@ mdb_prefix_stride_entry_acquire(MDB_prefix_stride_cache *cache, pgno_t pgno,
 {
 	if (!cache || !out)
 		return EINVAL;
+	/* Zero is the invalid-entry tag. Seed zero-initialized/cleared caches
+	 * before returning an entry; rebuild requires a nonzero generation. */
+	if (!cache->generation)
+		cache->generation = 1;
 
 	MDB_prefix_stride_entry *entry =
 	    mdb_prefix_stride_entry_find_slot(cache->entries, cache->capacity,
@@ -3069,6 +3102,10 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 	if (!IS_LEAF(mp) || IS_LEAF2(mp) || IS_SUBP(mp))
 		return MDB_SUCCESS;
 
+	MDB_prefix_stride_cache *cache = &mc->mc_txn->mt_prefix.stride_cache;
+	/* acquire() must establish the tag before rebuild can stamp it. */
+	mdb_cassert(mc, cache->generation != 0);
+
 	unsigned int total = NUMKEYS(mp);
 	int rc = mdb_prefix_stride_entry_reserve(entry, total ? total : 1);
 	if (rc != MDB_SUCCESS)
@@ -3080,7 +3117,7 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 	if (!total) {
 		entry->max_len = 0;
 		entry->max_valid = 1;
-		entry->valid = 1;
+		entry->valid = cache->generation;
 		mdb_prefix_leaf_store_stride(mc, mp, 0);
 		return MDB_SUCCESS;
 	}
@@ -3102,7 +3139,7 @@ mdb_prefix_stride_entry_rebuild(MDB_cursor *mc, MDB_page *mp,
 
 	entry->max_len = max_len;
 	entry->max_valid = 1;
-	entry->valid = 1;
+	entry->valid = cache->generation;
 	mdb_prefix_leaf_store_stride(mc, mp, max_len);
 	return MDB_SUCCESS;
 }
@@ -3131,7 +3168,8 @@ mdb_prefix_stride_prepare(MDB_cursor *mc, MDB_page *mp,
 	if (!entry)
 		return MDB_SUCCESS;
 
-	if (!entry->valid || entry->count != NUMKEYS(mp)) {
+	if (entry->valid != scratch->stride_cache.generation ||
+	    entry->count != NUMKEYS(mp)) {
 		entry->valid = 0;
 		rc = mdb_prefix_stride_entry_rebuild(mc, mp, entry);
 		if (rc != MDB_SUCCESS)
@@ -3584,12 +3622,14 @@ mdb_prefix_scratch_reset(MDB_prefix_scratch *scratch)
 
 	memset(&scratch->measure_cache, 0, sizeof(scratch->measure_cache));
 
-	if (scratch->stride_cache.entries) {
-		for (unsigned int i = 0; i < scratch->stride_cache.capacity; ++i) {
-			MDB_prefix_stride_entry *entry = &scratch->stride_cache.entries[i];
-			if (entry->pgno != P_INVALID)
-				entry->valid = 0;
-		}
+	/* Retain allocations; advancing the generation normally invalidates
+	 * metadata in constant time. On wrap, explicitly clear all entry tags
+	 * so reusing generation 1 cannot make stale entries valid again. */
+	MDB_prefix_stride_cache *cache = &scratch->stride_cache;
+	if (++cache->generation == 0) {
+		cache->generation = 1;
+		for (unsigned int i = 0; i < cache->capacity; ++i)
+			cache->entries[i].valid = 0;
 	}
 }
 
@@ -5354,33 +5394,6 @@ mdb_strerror(int err)
 	return strerror(err);
 #endif
 }
-
-/** assert(3) variant in cursor context */
-#define mdb_cassert(mc, expr)	mdb_assert0((mc)->mc_txn->mt_env, expr, #expr)
-/** assert(3) variant in transaction context */
-#define mdb_tassert(txn, expr)	mdb_assert0((txn)->mt_env, expr, #expr)
-/** assert(3) variant in environment context */
-#define mdb_eassert(env, expr)	mdb_assert0(env, expr, #expr)
-
-#ifndef NDEBUG
-# define mdb_assert0(env, expr, expr_txt) ((expr) ? (void)0 : \
-		mdb_assert_fail(env, expr_txt, mdb_func_, __FILE__, __LINE__))
-
-static void ESECT
-mdb_assert_fail(MDB_env *env, const char *expr_txt,
-	const char *func, const char *file, int line)
-{
-	char buf[400];
-	sprintf(buf, "%.100s:%d: Assertion '%.200s' failed in %.40s()",
-		file, line, expr_txt, func);
-	if (env->me_assert_func)
-		env->me_assert_func(env, buf);
-	fprintf(stderr, "%s\n", buf);
-	abort();
-}
-#else
-# define mdb_assert0(env, expr, expr_txt) ((void) 0)
-#endif /* NDEBUG */
 
 static indx_t
 mdb_page_insert_slot(MDB_cursor *mc, MDB_page *mp, indx_t indx, size_t node_size)
@@ -7928,6 +7941,8 @@ _mdb_txn_commit(MDB_txn *txn)
 		} else { /* Simplify the above for single-ancestor case */
 			len = MDB_IDL_UM_MAX - txn->mt_dirty_room;
 		}
+		/* Child pages can change key lengths without changing key counts. */
+		mdb_prefix_scratch_reset(&parent->mt_prefix);
 		/* Merge our dirty list with parent's */
 		y = src[0].mid;
 		for (i = len; y; dst[i--] = src[y--]) {

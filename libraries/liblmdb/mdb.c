@@ -6353,6 +6353,11 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 			/* Prepare to fetch more and coalesce */
 			last = env->me_pglast;
 			oldest = env->me_pgoldest;
+			/* The oldest reader cannot advance past the last committed
+			 * txn while this writer is active. Avoid rescanning once
+			 * the cached boundary has reached that limit.
+			 */
+			found_old = (oldest == txn->mt_txnid - 1);
 			mdb_cursor_init(&m2, txn, FREE_DBI, &m2x);
 #if (MDB_DEVEL) & 2	/* "& 2" so MDB_DEVEL=1 won't hide bugs breaking freeDB */
 			/* Use original snapshot. TODO: Should need less care in code

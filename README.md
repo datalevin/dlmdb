@@ -15,6 +15,7 @@ features:
 * DUPSORT iteration optimization.
 * More robust interrupt handling.
 * True in-memory mode (`MDB_INMEMORY`).
+* Various performance optimizations.
 
 These features are critical for Datalevin's high performance: the order
 statistics facilitate query planning; prefix compression couples
@@ -41,20 +42,28 @@ Properties:
 * Data lives only in process memory and is lost on `mdb_env_close`.
 * Concurrent readers are supported (single-writer semantics are still enforced).
 
-## In-memory vs file-backed benchmark
+### In-memory vs file-backed benchmark
 
 `inmem_bench` runs the same write/read workload on file-backed and in-memory
 environments and reports average timings and speedup.
 
-Example run:
-
-```
+```sh
 ./inmem_bench --entries 200000 --value-size 64 --rounds 3 --no-lock
-entries=200000 value_size=64 rounds=3 mapsize=76800000
-file-backed avg: write=95.74 ms read=70.47 ms checksum=25493856
-in-memory  avg: write=69.08 ms read=66.47 ms checksum=25493856
-speedup: write=1.39x read=1.06x
 ```
+
+Results refreshed on 2026-09-20, using an Apple M3 Pro with 36 GiB RAM,
+16 KiB pages, and Apple Clang 21.0.0 with the Makefile's `-O2 -g` flags.
+The refreshed benchmark tables use medians of three complete invocations,
+retaining each harness's internal rounds. Speedups compare the two paths within
+the current build.
+
+| Operation | File-backed | In-memory | Speedup |
+|---|---:|---:|---:|
+| Write, including commit | 79.37 ms | 68.36 ms | 1.16x |
+| Read | 67.79 ms | 66.08 ms | 1.03x |
+
+Each invocation averages three rounds with a 76,800,000-byte map. Both modes
+returned checksum 25,493,856. The file-backed write includes its durable commit.
 
 ## Order-statistics API
 
@@ -130,47 +139,34 @@ uint64_t total = 0;
 int rc = mdb_count_range(txn, dbi, &low, &high, MDB_RANGE_INCLUDE_LOWER, &total);
 ```
 
-## Counted DB Benchmark
+### Counted DB Benchmark
 
 `count_bench` exercises both naive cursor scans and the counted APIs. With
 100,000 entries, 200 sampled queries, a span of 10,000 keys, and 20 duplicates
 per key:
 
-```
+```sh
 ./count_bench --entries 100000 --queries 200 --span 10000 --dups 20 --shuffle
-Benchmark with 100000 entries, 200 queries, span 10000
-Insert order: shuffled
-
-== Plain DB Inserts ==
-  plain:   54.28 ms (0.54 us/op)
-  counted: 55.31 ms (0.55 us/op)
-  overhead: 1.03 ms (1.89%)
-
-== Range Count (keys) ==
-  naive cursor: 30.01 ms (150.06 us/op)
-  counted API:  0.18 ms (0.88 us/op)
-  speedup: 170.52x
-
-== Rank Lookup ==
-  naive (sampled 128): 70.69 ms (552.30 us/op)
-  cursor API:        0.09 ms (0.43 us/op)
-  mdb_get_rank:      0.05 ms (0.23 us/op)
-  speedup: 1269.67x
-
-== Dupsort Inserts ==
-  plain:   960.70 ms (0.48 us/op)
-  counted: 979.46 ms (0.49 us/op)
-  overhead: 18.75 ms (1.95%)
-
-== Dupsort Range Count ==
-  dup/key: 20
-  cursor (mdb_cursor_count): 74.21 ms (371.04 us/op)
-  counted API:              0.23 ms (1.15 us/op)
-  speedup: 324.05x
 ```
 
-In short: counted metadata adds negligible write-time overhead while delivering
-two to three orders of magnitude acceleration for range counts and rank lookups.
+Median results, 2026-09-20. Both layouts use prefix compression; uncounted
+means that only `MDB_COUNTED` is absent.
+
+| Insert workload | Uncounted | Counted | Elapsed change |
+|---|---:|---:|---:|
+| 100,000 unique keys | 56.29 ms | 56.73 ms | +0.8% |
+| 2,000,000 DUPSORT values | 1,025.92 ms | 1,040.85 ms | +1.5% |
+
+| Query | Cursor scan (µs/query) | Counted API (µs/query) | Speedup |
+|---|---:|---:|---:|
+| Range count, unique keys | 171.49 | 0.94 | 182.43x |
+| Rank lookup, cursor API | 599.89 | 0.57 | 1,051.18x |
+| Range count, DUPSORT | 536.04 | 1.52 | 346.95x |
+
+Query speedups are medians of the harness's reported ratios. The naive rank
+lookup samples 128 queries; per-query times normalize it against the 200
+counted queries. Direct `mdb_get_rank` measured 0.26 µs/query. In this workload,
+counted metadata adds little insertion cost while avoiding long cursor scans.
 
 ### Sparse sampling
 
@@ -184,26 +180,25 @@ strategies:
 * **Stride scan (MDB_NEXT)** – a baseline that seeds the cursor once and then
   advances via `MDB_NEXT` for every skipped record, i.e. a traditional cursor walk.
 
-Example runs on a single SSD-backed workstation (stride of 10000, 1000 samples):
+The documented workload uses a stride of 10,000 and 1,000 samples:
 
-```
+```sh
 ./sample_bench --entries 10000000 --samples 1000 --batch 250000 --mode both \
                --path ./bench_sample_plain
-Preparing 10000000 entries (batch 250000, stride 10000, samples 1000, dups 1)
-Population: 1789.28 ms (5.59 M entries/sec)
-Warm sequential: samples=1000 total=1.71 ms avg=1.71 us/op
-Stride scan (MDB_NEXT): samples=1000 total=92.36 ms avg=92.36 us/op
-
 ./sample_bench --entries 10000000 --samples 1000 --batch 250000 --mode both \
                --dups 8 --path ./bench_sample_dups
-Preparing 10000000 entries (batch 250000, stride 10000, samples 1000, dups 8)
-Population: 4444.42 ms (2.25 M entries/sec)
-Warm sequential: samples=1000 total=1.55 ms avg=1.55 us/op
-Stride scan (MDB_NEXT): samples=1000 total=153.60 ms avg=153.60 us/op
 ```
 
-For both plain and dupsort databases, the counted cursor path is roughly two
-orders of magnitude faster than a sequential scan when sampling sparsely.
+Median results, 2026-09-20; sampling times cover all 1,000 samples:
+
+| Layout | Population | Stride scan | Counted cursor | Sampling speedup |
+|---|---:|---:|---:|---:|
+| Unique keys | 1,910.68 ms | 103.40 ms | 1.81 ms | 57.13x |
+| Eight duplicates/key | 4,681.41 ms | 162.35 ms | 1.61 ms | 100.84x |
+
+Both use the default 16 GiB map and
+`MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOLOCK`. The counted cursor skips the
+intervening records; these speedups apply to sparse sampling at this stride.
 
 ## Prefix Compression
 
@@ -224,110 +219,61 @@ cursor API; the optimization is completely internal to the engine.
 
 ### Prefix compression performance
 
-`compress_bench` measures workloads with and without prefix compression. With
-1,000,000 entries, 64-byte values, 16-byte shared prefixes, and
-duplicate-heavy traffic:
+`compress_bench` compares counted databases with and without prefix
+compression. This workload uses 1,000,000 entries, 64-byte values, 16-byte
+shared prefixes, 500,000 reads, 500,000 updates, and 500,000 deletes, with
+20 duplicates per key in the DUPSORT variants:
 
-```
-./compress_bench -n 1000000 -r 500000 -v 64 -p 16 -m 4096  -U 500000 -X 500000 -D 20
-=== plain (plain, unique) ===
-Entries: 1000000, Value bytes: 64, Prefix bytes: 16
-Insert: 892.050 ms (0.892 us/op, 1121013 op/s over 1000000 ops)
-Update: 429.478 ms (0.859 us/op, 1164204 op/s over 500000 ops)
-Delete: 664.230 ms (1.328 us/key, 752751 key/s over 500000 keys)
-Reinsert: 506.389 ms (1.013 us/key, 987383 key/s over 500000 keys)
-Random Read (cold): 385.790 ms (0.772 us/op, 1296042 op/s over 500000 ops)
-Random Read (warm): 376.617 ms (0.753 us/op, 1327609 op/s over 500000 ops)
-Range Scan (cold): 6.989 ms (0.027 us/key, 36628988 key/s over 256000 keys)
-Range Scan (warm): 4.172 ms (0.016 us/key, 61361457 key/s over 256000 keys)
-Files: data 440.25 MiB, lock 0.00 B (total 440.25 MiB)
-Map: 440.25 MiB used / 4.00 GiB configured
-Tree: depth=3, pages(branch=33, leaf=9348, overflow=0), page size=16384
-
-=== prefix (prefix, unique) ===
-Entries: 1000000, Value bytes: 64, Prefix bytes: 16
-Insert: 901.957 ms (0.902 us/op, 1108700 op/s over 1000000 ops)
-Update: 378.016 ms (0.756 us/op, 1322695 op/s over 500000 ops)
-Delete: 764.350 ms (1.529 us/key, 654151 key/s over 500000 keys)
-Reinsert: 504.187 ms (1.008 us/key, 991696 key/s over 500000 keys)
-Random Read (cold): 364.227 ms (0.728 us/op, 1372770 op/s over 500000 ops)
-Random Read (warm): 332.968 ms (0.666 us/op, 1501646 op/s over 500000 ops)
-Range Scan (cold): 6.535 ms (0.026 us/key, 39173680 key/s over 256000 keys)
-Range Scan (warm): 4.461 ms (0.017 us/key, 57386236 key/s over 256000 keys)
-Files: data 331.89 MiB, lock 0.00 B (total 331.89 MiB)
-Map: 331.89 MiB used / 4.00 GiB configured
-Tree: depth=3, pages(branch=33, leaf=7040, overflow=0), page size=16384
-
-=== plain-dups (plain, dupsort) ===
-Entries: 1000000, Value bytes: 64, Prefix bytes: 16, Duplicates/key target: 20 (~50000 unique keys)
-Insert: 1221.752 ms (1.222 us/op, 818497 op/s over 1000000 ops)
-Update: 970.830 ms (1.942 us/op, 515023 op/s over 500000 ops)
-Delete: 612.807 ms (1.226 us/key, 815918 key/s over 500000 keys)
-Reinsert: 706.770 ms (1.414 us/key, 707444 key/s over 500000 keys)
-Random Read (cold): 384.830 ms (0.770 us/op, 1299275 op/s over 500000 ops)
-Random Read (warm): 373.916 ms (0.748 us/op, 1337199 op/s over 500000 ops)
-Range Scan (cold): 6.538 ms (0.026 us/key, 39155705 key/s over 256000 keys)
-Range Scan (warm): 4.442 ms (0.017 us/key, 57631697 key/s over 256000 keys)
-Files: data 339.59 MiB, lock 0.00 B (total 339.59 MiB)
-Map: 339.59 MiB used / 4.00 GiB configured
-Tree: depth=3, pages(branch=33, leaf=7206, overflow=0), page size=16384
-
-=== prefix-dups (prefix, dupsort) ===
-Entries: 1000000, Value bytes: 64, Prefix bytes: 16, Duplicates/key target: 20 (~50000 unique keys)
-Insert: 1025.675 ms (1.026 us/op, 974968 op/s over 1000000 ops)
-Update: 762.434 ms (1.525 us/op, 655794 op/s over 500000 ops)
-Delete: 361.905 ms (0.724 us/key, 1381578 key/s over 500000 keys)
-Reinsert: 476.998 ms (0.954 us/key, 1048222 key/s over 500000 keys)
-Random Read (cold): 308.160 ms (0.616 us/op, 1622534 op/s over 500000 ops)
-Random Read (warm): 297.377 ms (0.595 us/op, 1681367 op/s over 500000 ops)
-Range Scan (cold): 5.128 ms (0.020 us/key, 49921997 key/s over 256000 keys)
-Range Scan (warm): 4.360 ms (0.017 us/key, 58715596 key/s over 256000 keys)
-Files: data 77.44 MiB, lock 0.00 B (total 77.44 MiB)
-Map: 77.44 MiB used / 4.00 GiB configured
-Tree: depth=3, pages(branch=9, leaf=1679, overflow=0), page size=16384
-
---- Relative to plain ---
-Insert time: 1.011x (892.050 ms -> 901.957 ms)
-Update time: 0.880x (429.478 ms -> 378.016 ms)
-Delete time: 1.151x (664.230 ms -> 764.350 ms)
-Reinsert time: 0.996x (506.389 ms -> 504.187 ms)
-Random read (warm): 0.884x
-Random read (cold): 0.944x
-Range scan (warm): 1.069x
-Data size: 0.754x (461635584 -> 348012544 bytes)
-Map used: 0.754x (440.25 MiB -> 331.89 MiB)
-Leaf pages: 0.753x (9348 -> 7040)
-
---- Relative to plain-dups ---
-Insert time: 0.840x (1221.752 ms -> 1025.675 ms)
-Update time: 0.785x (970.830 ms -> 762.434 ms)
-Delete time: 0.591x (612.807 ms -> 361.905 ms)
-Reinsert time: 0.675x (706.770 ms -> 476.998 ms)
-Random read (warm): 0.795x
-Random read (cold): 0.801x
-Range scan (warm): 0.982x
-Data size: 0.228x (356089856 -> 81199104 bytes)
-Map used: 0.228x (339.59 MiB -> 77.44 MiB)
-Leaf pages: 0.233x (7206 -> 1679)
-
+```sh
+./compress_bench -n 1000000 -r 500000 -v 64 -p 16 -m 4096 \
+    -U 500000 -X 500000 -D 20
 ```
 
-For this highly redundant data set, prefix compression therefore shrinks on-disk
-footprint by ~25 % for regular database and ~75 % for DUPSORT database, while
-keeping read/write throughput on par with the uncompressed baseline. In fact,
-compressed performance is generally slightly better than the uncompressed cases
-in DUPSORT workloads. As Datalevin's triple storage uses this format, we did
-more optimizations.
+Median results, 2026-09-20, in milliseconds. Speedup is uncompressed time
+divided by compressed time; values below 1 mean compression took longer.
+All variants use a 4 GiB map, `MDB_NOLOCK`, and default durability. Operation
+timers exclude the final commit. Range scans visit up to 256 keys across
+1,000 ranges. “Cold” means a reopened environment; the OS cache is not purged.
 
-## DUPFIXED LEAF2 Benchmark
+Unique keys:
 
-`leaf2_bench` compares fixed-width LEAF2 duplicate pages with normal
-prefix-compressed duplicate trees. Both variants use `MDB_DUPSORT`,
-`MDB_COUNTED`, and `MDB_PREFIX_COMPRESSION`; the only database flag difference
-is `MDB_DUPFIXED`. They receive identical 16-byte keys, ordered 8-byte values,
-transaction batches, and scalar `MDB_APPENDDUP` calls.
+| Operation | Uncompressed | Prefix | Speedup |
+|---|---:|---:|---:|
+| Insert | 973.102 | 1,136.970 | 0.856x |
+| Update | 489.617 | 479.469 | 1.021x |
+| Delete | 720.147 | 886.444 | 0.812x |
+| Reinsert | 564.517 | 608.555 | 0.928x |
+| Random Read (cold) | 438.773 | 415.230 | 1.057x |
+| Random Read (warm) | 438.868 | 405.480 | 1.082x |
+| Range Scan (cold) | 7.240 | 7.102 | 1.019x |
+| Range Scan (warm) | 5.141 | 5.393 | 0.953x |
 
-### LEAF2 read-side specialization
+DUPSORT:
+
+| Operation | Uncompressed | Prefix | Speedup |
+|---|---:|---:|---:|
+| Insert | 1,371.212 | 1,234.082 | 1.111x |
+| Update | 1,045.679 | 941.480 | 1.111x |
+| Delete | 691.383 | 497.317 | 1.390x |
+| Reinsert | 749.160 | 557.608 | 1.344x |
+| Random Read (cold) | 439.207 | 366.538 | 1.198x |
+| Random Read (warm) | 437.319 | 363.841 | 1.202x |
+| Range Scan (cold) | 6.792 | 5.444 | 1.248x |
+| Range Scan (warm) | 4.978 | 4.694 | 1.061x |
+
+| Layout | Uncompressed data file | Prefix data file | Reduction |
+|---|---:|---:|---:|
+| Unique keys | 440.25 MiB | 331.89 MiB | 24.6% |
+| DUPSORT | 339.59 MiB | 77.44 MiB | 77.2% |
+
+Compression saves substantial space on these redundant keys and values.
+DUPSORT operations are 1.06–1.39x faster in these medians. Unique-key inserts,
+deletes, and reinserts are slower, while updates and random reads benefit;
+the space saving does not imply that every operation becomes faster.
+
+## LEAF2 read-side specialization
+
+LEAF2 format stores fixed size values in DUPSORT, used in Datalog AVE index.
 
 `mdb_cursor_list_dup()` returns every duplicate for the cursor's current key.
 Inline LEAF2 duplicates already map directly to their containing page. When a
@@ -348,6 +294,14 @@ same API and cursor-position contract apply whether the caller starts on the
 first, middle, or last duplicate. Normal prefix-compressed DUPSORT trees keep
 the existing scalar decode-and-copy path because their values are variable
 width and may use cursor-owned decode buffers.
+
+### DUPFIXED LEAF2 Benchmark
+
+`leaf2_bench` compares fixed-width LEAF2 duplicate pages with normal
+prefix-compressed duplicate trees. Both variants use `MDB_DUPSORT`,
+`MDB_COUNTED`, and `MDB_PREFIX_COMPRESSION`; the only database flag difference
+is `MDB_DUPFIXED`. They receive identical 16-byte keys, ordered 8-byte values,
+transaction batches, and scalar `MDB_APPENDDUP` calls.
 
 The benchmark uses independent fresh databases for append, interior insert, and
 exact-value delete workloads. It also measures validated scalar scans, random
@@ -370,27 +324,108 @@ values), four fresh A/B rounds, three repeated read passes, 100,000 exact
 lookups, 65,536-value transactions, a 1 GiB map, and
 `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOLOCK`. The OS page cache is not purged.
 
-Representative results measured on 2026-08-29 on a MacBook Pro with an Apple
-M3 Pro (12 cores, 36 GB RAM), macOS 26.6.2, 16 KiB pages, and Apple clang
-21.0.0 using the Makefile's `-O2 -g` flags:
+Results refreshed on 2026-09-20 with the hardware and compiler described
+above. The table takes the median of three complete default-workload runs,
+including the harness's per-round paired speedups:
 
 | Operation | Prefix DUPSORT | DUPFIXED LEAF2 | Paired result |
 | --- | ---: | ---: | ---: |
-| Scalar append cursor puts | 161.947 ms | 74.821 ms | 2.174x speedup |
-| Interior cursor inserts | 389.317 ms | 227.374 ms | 1.723x speedup |
-| Exact-value `mdb_del` | 1582.207 ms | 372.374 ms | 4.254x speedup |
-| Repeated scalar scan | 16.343 ms | 9.727 ms | 1.699x speedup |
-| Repeated `mdb_cursor_list_dup` | 11.855 ms | 0.679 ms | 17.453x speedup |
-| Random `MDB_GET_BOTH` | 102.626 ms | 34.108 ms | 2.957x speedup |
+| Scalar append cursor puts | 160.877 ms | 80.326 ms | 2.025x speedup |
+| Interior cursor inserts | 398.703 ms | 240.701 ms | 1.668x speedup |
+| Exact-value `mdb_del` | 1,587.701 ms | 372.727 ms | 4.265x speedup |
+| Repeated scalar scan | 16.182 ms | 9.418 ms | 1.720x speedup |
+| Repeated `mdb_cursor_list_dup` | 12.206 ms | 0.698 ms | 17.559x speedup |
+| Random `MDB_GET_BOTH` | 113.732 ms | 37.442 ms | 2.993x speedup |
 | Append high-water footprint | 20.23 bytes/value | 16.23 bytes/value | 0.802x size |
 
 The LEAF2 `MDB_GET_MULTIPLE` scan consumed all values in 768 chunks in
-0.418 ms. Page-based LEAF2 collection reduced the repeated `list_dup` scan from
-2.841 ms before the specialization to 0.679 ms, a 4.18x improvement. The
-separate `MDB_MULTIPLE` write run issued 256 calls of 4096 values and reached
-18.781 million values/second, a 1.344x speedup over scalar LEAF2 append. The
-footprint is the environment page high-water mark, not a compacted or live-page
-size; benchmark results will vary with hardware and cache state.
+0.434 ms. Repeated `mdb_cursor_list_dup` took 0.698 ms, with a 17.559x paired
+speedup over prefix-compressed duplicate trees.
+
+The supplemental `MDB_MULTIPLE` write run issued 256 calls of 4096 values.
+Its put loop took **3.042 ms**, reaching **344.643 million values/second**,
+with a **25.461x paired speedup** over scalar LEAF2 append. Including commits,
+the complete bulk load took 4.508 ms. This uses a different write API and is
+reported separately from the layout comparison above. The footprint is the
+environment page high-water mark, not a compacted or live-page size.
+
+## Cursor Reuse Benchmark
+
+`cursor_reuse_bench` measures repeated cursor puts within and across leaves.
+It runs ordinary counted, prefix-compressed counted, and prefix-compressed
+DUPSORT/DUPFIXED trees, with forward, backward, random, and three same-leaf
+patterns. Every case compares **before** (whole-leaf search, root fallback
+across leaves) with **after** (bounded ordinary leaf search plus retained
+ancestors) in one invocation. Both sides reuse the current leaf when it
+contains the target. The new ordinary leaf search probes the adjacent key
+first, then searches only the interval allowed by earlier comparisons.
+
+```sh
+make -C libraries/liblmdb cursor_reuse_bench
+./libraries/liblmdb/cursor_reuse_bench
+./libraries/liblmdb/cursor_reuse_bench --mode prefix --pattern forward \
+    --entries 300000 --ops 200000 --stride 257 --map-mb 2048 --runs 5
+./libraries/liblmdb/cursor_reuse_bench --mode plain --pattern same-leaf \
+    --ops 2000000 --runs 8
+```
+
+Each case creates a temporary database with 256-byte keys and 64-byte values,
+warms a write transaction, then times puts through one retained cursor. The
+DUPSORT case puts an existing value again; other cases replace values. Final
+values and entry counts are verified outside the timer, and temporary files
+are removed. Five pairs run by default, alternating which side goes first.
+The summary shows median before/after times, elapsed-time change, speedup,
+tree depth, and page size. `--verbose` prints each individual sample. Trees
+need at least three levels to retain an ancestor below the root.
+`same-leaf`, `same-leaf-backward`, and `same-leaf-random` visit the first
+eight keys in forward, backward, and fixed-seed random order, respectively.
+
+The benchmark uses `MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOLOCK`; it measures warm
+cursor positioning and writes, excluding commit and durability costs. A
+private switch compiled only into this benchmark selects the two search paths;
+ordinary library builds contain no switch.
+
+Results measured on 2026-09-20 on an Apple M3 Pro with 36 GiB RAM, 16 KiB
+pages, and Apple Clang 21.0.0 using `-O2 -g`. The default workload uses
+300,000 entries, 200,000 puts per case, a stride of 257 for forward/backward
+patterns, and a 2 GiB map. Times are medians of five alternating before/after
+pairs; speedup is before divided by after.
+
+| Mode | Pattern | Before (ms) | After (ms) | Speedup |
+|---|---|---:|---:|---:|
+| Ordinary counted | Forward | 218.161 | 199.072 | 1.096x |
+| Ordinary counted | Backward | 210.046 | 190.386 | 1.103x |
+| Ordinary counted | Random | 232.177 | 233.615 | 0.994x |
+| Ordinary counted | Same leaf: forward | 23.167 | 11.940 | 1.940x |
+| Ordinary counted | Same leaf: backward | 22.989 | 13.939 | 1.649x |
+| Ordinary counted | Same leaf: random | 22.095 | 19.174 | 1.152x |
+| Prefix counted | Forward | 206.541 | 186.347 | 1.108x |
+| Prefix counted | Backward | 195.544 | 173.869 | 1.125x |
+| Prefix counted | Random | 204.406 | 209.076 | 0.978x |
+| Prefix counted | Same leaf: forward | 43.097 | 43.032 | 1.002x |
+| Prefix counted | Same leaf: backward | 42.854 | 42.586 | 1.006x |
+| Prefix counted | Same leaf: random | 39.861 | 40.508 | 0.984x |
+| Prefix counted DUPSORT | Forward | 247.722 | 240.095 | 1.032x |
+| Prefix counted DUPSORT | Backward | 216.579 | 203.252 | 1.066x |
+| Prefix counted DUPSORT | Random | 240.940 | 235.085 | 1.025x |
+| Prefix counted DUPSORT | Same leaf: forward | 68.686 | 67.536 | 1.017x |
+| Prefix counted DUPSORT | Same leaf: backward | 55.889 | 55.962 | 0.999x |
+| Prefix counted DUPSORT | Same leaf: random | 57.276 | 57.727 | 0.992x |
+
+Longer ordinary counted same-leaf runs, with **2,000,000 puts and eight
+alternating pairs**, confirm the improvement:
+
+| Same-leaf pattern | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|
+| Forward | 228.428 | 115.412 | 1.979x |
+| Backward | 228.704 | 136.472 | 1.676x |
+| Random | 213.298 | 188.676 | 1.130x |
+
+Cross-leaf forward/backward cases show 1.03–1.13x speedups. Across-tree random
+times ranged from 2.4% faster to 2.3% slower. All 180 default samples and 48
+longer same-leaf samples verified final values and counts, and each pair
+produced matching tree shapes. Timings on this active machine vary with cache
+and scheduling conditions.
 
 ## Startup Benchmark
 
@@ -450,21 +485,26 @@ B-trees. Promoted `MDB_DUPFIXED` sets use the
 Normal prefix-compressed DUPSORT trees retain the scalar decode-and-copy
 fallback, using cursor-owned storage so values remain valid after traversal.
 
-`dup_iter_bench` compares the fast path with the old per-duplicate loop:
+`dup_iter_bench` compares the fast path with the per-duplicate loop:
 
-```
+```sh
 cd libraries/liblmdb
 make dup_iter_bench
 ./dup_iter_bench --keys 20000 --dups 20 --runs 5
-Benchmark configuration: keys=20000 dups/key=20 runs=5
-Total key visits: 100000, total duplicates read: 2000000
-mdb_cursor_list_dup: 19.270 ms (0.193 us/key, 9.635 ns/value)
-MDB_NEXT_DUP loop:   34.006 ms (0.340 us/key, 17.003 ns/value)
 ```
 
-By keeping duplicate iteration inside the cache and avoiding repeated cursor
-jumps, `mdb_cursor_list_dup` cuts the inner-loop cost roughly in half for common
-key/dups iteration.
+Median results, 2026-09-20. Each invocation visits 100,000 keys and reads
+2,000,000 duplicate values across five passes, using a 512 MiB map and
+`MDB_NOSYNC | MDB_NOMETASYNC | MDB_NOLOCK`.
+
+| Method | Total time | Time/value |
+|---|---:|---:|
+| `MDB_NEXT_DUP` loop | 34.045 ms | 17.023 ns |
+| `mdb_cursor_list_dup` | 21.052 ms | 10.526 ns |
+
+For this workload, `mdb_cursor_list_dup` takes 38% less iteration time,
+a 1.62x speedup. These are variable-width prefix-compressed duplicates;
+fixed-width LEAF2 sets have the separate page-based results above.
 
 ## Interrupt handling
 

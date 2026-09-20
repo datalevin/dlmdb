@@ -44,7 +44,7 @@ ILIBS	= $(LIBS) $(SHLIBS)
 LINKLIBS	= $(LIBS)
 IPROGS	= dlmdb_stat dlmdb_copy dlmdb_dump dlmdb_load dlmdb_drop
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_generation mtest_reader mtest_inmem mtest_leaf2 count_bench compress_bench sample_bench dup_iter_bench leaf2_bench inmem_bench startup_bench seek_bench
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_generation mtest_reader mtest_cursor_reuse mtest_inmem mtest_leaf2 count_bench compress_bench cursor_reuse_bench sample_bench dup_iter_bench leaf2_bench inmem_bench startup_bench seek_bench
 
 all:	$(ILIBS) $(PROGS)
 
@@ -72,6 +72,7 @@ test:	all
 	./mtest_prefix
 	./mtest_prefix_generation
 	./mtest_reader
+	./mtest_cursor_reuse
 	./mtest_inmem
 	rm -rf testdb_count*
 	./mtest_count
@@ -104,10 +105,16 @@ mtest_prefix_generation: mtest_prefix_generation.c mdb.c dlmdb.h midl.h midl.o
 # Inspect reader boundaries and allocated page numbers during reclamation.
 mtest_reader: mtest_reader.c mdb.c dlmdb.h midl.h midl.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) mtest_reader.c midl.o $(LDLIBS) -o $@
+# Compare reused cursor paths against fresh root searches.
+mtest_cursor_reuse: mtest_cursor_reuse.c mdb.c dlmdb.h midl.h midl.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) mtest_cursor_reuse.c midl.o $(LDLIBS) -o $@
 mtest_inmem:	mtest_inmem.o $(LINKLIBS)
 mtest_leaf2:	mtest_leaf2.o $(LINKLIBS)
 count_bench:	count_bench.o $(LINKLIBS)
 compress_bench:	compress_bench.o $(LINKLIBS)
+# Include both root-fallback and ancestor-reuse paths for paired timings.
+cursor_reuse_bench: cursor_reuse_bench.c mdb.c dlmdb.h midl.h midl.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) cursor_reuse_bench.c midl.o $(LDLIBS) -o $@
 sample_bench:	sample_bench.o $(LINKLIBS)
 dup_iter_bench:	dup_iter_bench.o $(LINKLIBS)
 leaf2_bench:	leaf2_bench.o $(LINKLIBS)

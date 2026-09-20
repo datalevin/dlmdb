@@ -10941,6 +10941,63 @@ mdb_page_search(MDB_cursor *mc, MDB_val *key, int flags)
 	return mdb_page_search_root(mc, key, flags);
 }
 
+#ifdef MDB_CURSOR_REUSE_BENCH
+/* Private switch for the standalone benchmark; absent from library builds. */
+static int mdb_cursor_reuse_bench_before;
+#endif
+
+/** Search from the deepest retained ancestor containing key. The caller
+ * compared key with a key on the current leaf; direction is nonzero.
+ * Only the fence in that direction can exclude key from the old subtree.
+ */
+static int
+mdb_page_search_reuse(MDB_cursor *mc, MDB_val *key, int direction)
+{
+	unsigned int level;
+	MDB_cmp_func *cmp = mc->mc_dbx->md_cmp;
+
+#ifdef MDB_CURSOR_REUSE_BENCH
+	if (mdb_cursor_reuse_bench_before)
+		return mdb_page_search(mc, key, 0);
+#endif
+	if (!(mc->mc_flags & C_INITIALIZED) || mc->mc_top < 2 ||
+	    (*mc->mc_dbflag & DB_STALE) || !mc->mc_pg[0] ||
+	    mc->mc_pg[0]->mp_pgno != mc->mc_db->md_root)
+		return mdb_page_search(mc, key, 0);
+
+	/* Check the old path from the root. Each accepted separator proves
+	 * that the next ancestor still contains key, including unbounded
+	 * first/last children. Equality belongs to the right-hand child.
+	 */
+	for (level = 0; level + 1 < mc->mc_top; ++level) {
+		MDB_page *mp = mc->mc_pg[level];
+		indx_t index = mc->mc_ki[level];
+		MDB_node *node;
+		MDB_val boundary;
+		int result;
+
+		if (!IS_BRANCH(mp) || index >= NUMKEYS(mp))
+			return mdb_page_search(mc, key, 0);
+		if (direction > 0) {
+			if (++index == NUMKEYS(mp))
+				continue;
+		} else if (!index) {
+			continue;
+		}
+		node = NODEPTR(mp, index);
+		boundary.mv_size = NODEKSZ(node);
+		boundary.mv_data = NODEKEY(mp, node);
+		result = cmp(key, &boundary);
+		if (direction > 0 ? result >= 0 : result < 0)
+			break;
+	}
+	while (mc->mc_top > level) {
+		MDB_PAGE_UNREF(mc->mc_txn, mc->mc_pg[mc->mc_top]);
+		mdb_cursor_pop(mc);
+	}
+	return mdb_page_search_root(mc, key, 0);
+}
+
 static int
 mdb_ovpage_free(MDB_cursor *mc, MDB_page *mp)
 {
@@ -11362,6 +11419,49 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
 	return MDB_SUCCESS;
 }
 
+/** Search an ordinary leaf using comparisons already made by cursor_set.
+ * key is strictly between the first and last keys, and differs from the
+ * current key. Probe its neighbor, then search only the remaining interval
+ * in that direction. The last key guarantees a valid lower-bound result.
+ */
+static MDB_node *
+mdb_node_search_near(MDB_cursor *mc, MDB_val *key, int direction, int *exactp)
+{
+	MDB_page *mp = mc->mc_pg[mc->mc_top];
+	MDB_cmp_func *cmp = mc->mc_dbx->md_cmp;
+	unsigned int low = 1, high = NUMKEYS(mp) - 2;
+	unsigned int i = mc->mc_ki[mc->mc_top];
+	MDB_node *node;
+	MDB_val nodekey;
+	int rc;
+
+	if (exactp)
+		*exactp = 0;
+	if (direction > 0)
+		low = ++i;
+	else
+		high = --i;
+	while (low <= high) {
+		node = NODEPTR(mp, i);
+		nodekey.mv_size = NODEKSZ(node);
+		nodekey.mv_data = NODEKEY(mp, node);
+		rc = cmp(key, &nodekey);
+		if (!rc) {
+			if (exactp)
+				*exactp = 1;
+			low = i;
+			break;
+		}
+		if (rc > 0)
+			low = i + 1;
+		else
+			high = i - 1;
+		i = (low + high) >> 1;
+	}
+	mc->mc_ki[mc->mc_top] = low;
+	return NODEPTR(mp, low);
+}
+
 /** Set the cursor on a specific data item. */
 static int
 mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
@@ -11482,6 +11582,19 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 								*exactp = 1;
 							goto set1;
 						}
+						if (!(mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+						    !IS_LEAF2(mp)
+#ifdef MDB_CURSOR_REUSE_BENCH
+						    && !mdb_cursor_reuse_bench_before
+#endif
+						    ) {
+							mc->mc_flags &= ~C_EOF;
+							leaf = mdb_node_search_near(mc, key, rc, exactp);
+							if (exactp && !*exactp)
+								return MDB_NOTFOUND;
+							rc = MDB_SUCCESS;
+							goto set1;
+						}
 					}
 					rc = 0;
 					mc->mc_flags &= ~C_EOF;
@@ -11521,11 +11634,11 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 			} else
 				return MDB_NOTFOUND;
 		}
+		rc = mdb_page_search_reuse(mc, key, rc);
 	} else {
 		mc->mc_pg[0] = 0;
+		rc = mdb_page_search(mc, key, 0);
 	}
-
-	rc = mdb_page_search(mc, key, 0);
 	if (rc != MDB_SUCCESS)
 		return rc;
 
@@ -12010,16 +12123,15 @@ mdb_cursor_put_cmp(MDB_cursor *mc, MDB_page *mp, indx_t idx,
 /** Position a DUPSORT write on an outer key without selecting a duplicate.
  *
  * Resolve keys that belong to the cursor's current leaf directly. Page
- * boundary cases restart from the root with the same write-only search,
- * keeping duplicate positioning out of this path. Read-side cursor
- * positioning remains unchanged.
+ * boundary cases descend from a retained ancestor when possible, keeping
+ * duplicate positioning out of this path.
  */
 static int
 mdb_cursor_put_set(MDB_cursor *mc, MDB_val *key, int *exactp)
 {
 	MDB_page *mp;
 	unsigned int i, nkeys;
-	int cmp, exact = 0, rc;
+	int cmp, exact = 0, rc, direction = 0;
 	int *matchp = exactp ? exactp : &exact;
 
 	*matchp = 0;
@@ -12056,8 +12168,10 @@ mdb_cursor_put_set(MDB_cursor *mc, MDB_val *key, int *exactp)
 			for (i = 0; i < mc->mc_top; ++i)
 				if (mc->mc_ki[i] < NUMKEYS(mc->mc_pg[i]) - 1)
 					break;
-			if (i != mc->mc_top)
+			if (i != mc->mc_top) {
+				direction = cmp;
 				goto tree_search;
+			}
 			mc->mc_ki[mc->mc_top] = nkeys;
 			*matchp = 0;
 			return MDB_NOTFOUND;
@@ -12071,8 +12185,10 @@ mdb_cursor_put_set(MDB_cursor *mc, MDB_val *key, int *exactp)
 			goto found;
 		}
 		if (cmp < 0) {
-			if (mc->mc_top)
+			if (mc->mc_top) {
+				direction = cmp;
 				goto tree_search;
+			}
 			mc->mc_ki[mc->mc_top] = 0;
 			*matchp = 0;
 			return MDB_NOTFOUND;
@@ -12086,7 +12202,8 @@ mdb_cursor_put_set(MDB_cursor *mc, MDB_val *key, int *exactp)
 	return MDB_NOTFOUND;
 
 tree_search:
-	rc = mdb_page_search(mc, key, 0);
+	rc = direction ? mdb_page_search_reuse(mc, key, direction) :
+		mdb_page_search(mc, key, 0);
 	if (rc != MDB_SUCCESS)
 		return rc;
 	mp = mc->mc_pg[mc->mc_top];

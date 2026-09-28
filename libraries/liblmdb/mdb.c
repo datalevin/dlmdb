@@ -3717,7 +3717,7 @@ static void mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node);
 
 static int
 mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed,
-	const MDB_val *old_trunk)
+	const MDB_val *old_trunk, int *preflight_full)
 {
 	MDB_env *env = mc->mc_txn->mt_env;
 	MDB_txn *txn = mc->mc_txn;
@@ -3732,6 +3732,8 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 	int rc = MDB_SUCCESS;
 	size_t capacity = mdb_prefix_page_capacity(mc, mp);
 
+	if (preflight_full)
+		*preflight_full = 0;
 	if (!IS_LEAF(mp) || IS_LEAF2(mp) || total == 0 || removed >= total)
 		return MDB_SUCCESS;
 
@@ -3842,8 +3844,11 @@ mdb_leaf_rebuild_after_trunk_delete(MDB_cursor *mc, MDB_page *mp, indx_t removed
 
 	rc = mdb_leaf_rebuild_measure(mc->mc_txn->mt_env, mc->mc_txn,
 	    entries, remain, capacity, NULL);
-	if (rc != MDB_SUCCESS)
+	if (rc != MDB_SUCCESS) {
+		if (preflight_full && rc == MDB_PAGE_FULL)
+			*preflight_full = 1;
 		return rc;
+	}
 
 	rc = mdb_leaf_rebuild_apply(mc, mp, entries, remain, capacity);
 	if (rc != MDB_SUCCESS)
@@ -13582,6 +13587,140 @@ mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	return rc;
 }
 
+#ifdef MDB_REBALANCE_COVERAGE
+static unsigned int mdb_prefix_inline_delete_promotions;
+#endif
+
+static void
+mdb_cursor_key_cache_invalidate(MDB_cursor *mc)
+{
+	mc->mc_key_pgno = P_INVALID;
+	mc->mc_key_last = (indx_t)~0;
+	mc->mc_key.mv_size = 0;
+	mc->mc_key.mv_data = NULL;
+	mdb_cursor_seq_invalidate(mc);
+	mdb_cursor_leaf_cache_reset(&mc->mc_leaf_cache);
+}
+
+/** Move an inline duplicate page to a real child page before its trunk is
+ * deleted. Replacing only the outer node's data keeps its key and prefix
+ * encoding unchanged; deleting and reinserting that node could itself force
+ * an unrelated outer-leaf trunk rebuild.
+ */
+static int
+mdb_prefix_promote_inline_for_delete(MDB_cursor *mc)
+{
+	MDB_env *env = mc->mc_txn->mt_env;
+	MDB_page *mp = mc->mc_pg[mc->mc_top];
+	indx_t ki = mc->mc_ki[mc->mc_top];
+	MDB_node *node = NODEPTR(mp, ki);
+	MDB_page *fp = NODEDATA(node), *root;
+	MDB_xcursor *mx = mc->mc_xcursor;
+	MDB_db subdb;
+	size_t old_capacity = NODEDSZ(node);
+	size_t key_bytes = EVEN(node->mn_ksize);
+	size_t old_bytes = EVEN(NODESIZE + key_bytes + old_capacity);
+	size_t new_bytes = EVEN(NODESIZE + key_bytes + sizeof(MDB_db));
+	size_t shift;
+	indx_t old_ptr = MP_PTRS(mp)[ki];
+	char *base;
+	int rc;
+
+	mdb_cassert(mc, mx && (node->mn_flags &
+	    (F_DUPDATA|F_SUBDATA)) == F_DUPDATA && IS_SUBP(fp));
+	if (new_bytes > old_bytes && new_bytes - old_bytes > SIZELEFT(mp))
+		return MDB_PAGE_FULL;
+	if (old_capacity > env->me_psize || old_capacity < PAGEHDRSZ)
+		return MDB_CORRUPTED;
+
+	subdb = mx->mx_db;
+	subdb.md_depth = 1;
+	subdb.md_branch_pages = 0;
+	subdb.md_leaf_pages = 1;
+	subdb.md_overflow_pages = 0;
+	subdb.md_entries = NUMKEYS(fp);
+	rc = mdb_page_new(mc, MP_FLAGS(fp) & ~P_SUBP, 1, &root);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	mdb_prefix_stride_entry_invalidate(mc->mc_txn, root->mp_pgno);
+	subdb.md_root = root->mp_pgno;
+	MP_PAD(root) = MP_PAD(fp);
+	MP_LOWER(root) = MP_LOWER(fp);
+	shift = env->me_psize - old_capacity;
+	MP_UPPER(root) = MP_UPPER(fp) + shift;
+	if (IS_LEAF2(fp)) {
+		memcpy(METADATA(root), METADATA(fp),
+		    NUMKEYS(fp) * fp->mp_pad);
+	} else {
+		memcpy((char *)root + MP_UPPER(root) + PAGEBASE,
+		    (char *)fp + MP_UPPER(fp) + PAGEBASE,
+		    old_capacity - MP_UPPER(fp) - PAGEBASE);
+		memcpy(MP_PTRS(root), MP_PTRS(fp),
+		    NUMKEYS(fp) * sizeof(indx_t));
+		for (unsigned int i = 0; i < NUMKEYS(fp); ++i)
+			MP_PTRS(root)[i] += shift;
+	}
+
+	base = (char *)mp + MP_UPPER(mp) + PAGEBASE;
+	if (new_bytes < old_bytes) {
+		shift = old_bytes - new_bytes;
+		memmove(base + shift, base,
+		    (char *)node + new_bytes - base);
+		for (unsigned int i = 0; i < NUMKEYS(mp); ++i)
+			if (MP_PTRS(mp)[i] <= old_ptr)
+				MP_PTRS(mp)[i] += shift;
+		MP_UPPER(mp) += shift;
+	} else if (new_bytes > old_bytes) {
+		shift = new_bytes - old_bytes;
+		memmove(base - shift, base,
+		    (char *)node + old_bytes - base);
+		for (unsigned int i = 0; i < NUMKEYS(mp); ++i)
+			if (MP_PTRS(mp)[i] <= old_ptr)
+				MP_PTRS(mp)[i] -= shift;
+		MP_UPPER(mp) -= shift;
+	}
+	mdb_prefix_stride_entry_invalidate(mc->mc_txn, mp->mp_pgno);
+	node = NODEPTR(mp, ki);
+	SETDSZ(node, sizeof(MDB_db));
+	node->mn_flags |= F_SUBDATA;
+	memcpy(NODEDATA(node), &subdb, sizeof(subdb));
+
+	mx->mx_db = subdb;
+	mx->mx_inline_bytes = 0;
+	mx->mx_inline_required = 0;
+	mx->mx_inline_measure_ready = 0;
+	mdb_cursor_key_cache_invalidate(mc);
+	mdb_cursor_key_cache_invalidate(&mx->mx_cursor);
+	mx->mx_cursor.mc_pg[0] = root;
+	for (MDB_cursor *m2 = mc->mc_txn->mt_cursors[mc->mc_dbi]; m2;
+	    m2 = m2->mc_next) {
+		MDB_xcursor *other;
+		if (m2 == mc || !(m2->mc_flags & C_INITIALIZED) ||
+		    m2->mc_snum < mc->mc_snum ||
+		    m2->mc_pg[mc->mc_top] != mp)
+			continue;
+		mdb_cursor_key_cache_invalidate(m2);
+		if (!m2->mc_xcursor)
+			continue;
+		other = m2->mc_xcursor;
+		mdb_cursor_key_cache_invalidate(&other->mx_cursor);
+		if (m2->mc_ki[mc->mc_top] != ki) {
+			XCURSOR_REFRESH(m2, mc->mc_top, mp);
+			continue;
+		}
+		other->mx_db = subdb;
+		other->mx_inline_bytes = 0;
+		other->mx_inline_required = 0;
+		other->mx_inline_measure_ready = 0;
+		if (other->mx_cursor.mc_flags & C_INITIALIZED)
+			other->mx_cursor.mc_pg[0] = root;
+	}
+#ifdef MDB_REBALANCE_COVERAGE
+	mdb_prefix_inline_delete_promotions++;
+#endif
+	return MDB_SUCCESS;
+}
+
 static int
 _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 {
@@ -13627,8 +13766,25 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 			}
 			if (!F_ISSET(leaf->mn_flags, F_SUBDATA)) {
 				mc->mc_xcursor->mx_cursor.mc_pg[0] = NODEDATA(leaf);
+				mc->mc_xcursor->mx_inline_bytes = NODEDSZ(leaf);
 			}
 			rc = _mdb_cursor_del(&mc->mc_xcursor->mx_cursor, MDB_NOSPILL);
+			if (rc == MDB_PAGE_FULL &&
+			    !(mc->mc_txn->mt_flags & MDB_TXN_ERROR) &&
+			    (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+			    (leaf->mn_flags & (F_DUPDATA|F_SUBDATA)) == F_DUPDATA &&
+			    IS_SUBP(mc->mc_xcursor->mx_cursor.mc_pg[0])) {
+				/* The child preflight found a larger replacement trunk.
+				 * It has not changed the inline page or its entry count.
+				 */
+				rc = mdb_prefix_promote_inline_for_delete(mc);
+				if (rc != MDB_SUCCESS)
+					goto fail;
+				leaf = NODEPTR(mc->mc_pg[mc->mc_top],
+				    mc->mc_ki[mc->mc_top]);
+				rc = _mdb_cursor_del(&mc->mc_xcursor->mx_cursor,
+				    MDB_NOSPILL);
+			}
 			if (rc)
 				return rc;
 			if (track_dup_delta)
@@ -14212,7 +14368,8 @@ mdb_node_del(MDB_cursor *mc, int ksize)
 		old_trunk.mv_size = first->mn_ksize;
 		old_trunk.mv_data = old_trunk_buf;
 		memcpy(old_trunk_buf, NODEKEY(mp, first), old_trunk.mv_size);
-		rc = mdb_leaf_rebuild_after_trunk_delete(mc, mp, indx, &old_trunk);
+		rc = mdb_leaf_rebuild_after_trunk_delete(mc, mp, indx,
+		    &old_trunk, NULL);
 		if (rc != MDB_SUCCESS)
 			mdb_txn_mark_error(mc->mc_txn, rc);
 		return;
@@ -14989,6 +15146,11 @@ mdb_update_key(MDB_cursor *mc, MDB_val *key)
 
 		base = (char *)mp + mp->mp_upper + PAGEBASE;
 		len = ptr - mp->mp_upper + NODESIZE;
+		/* The subtree count precedes the key in a counted branch node.
+		 * Move it with the header when resizing the separator.
+		 */
+		if (IS_BRANCH(mp) && IS_COUNTED(mp))
+			len += sizeof(uint64_t);
 		memmove(base - delta, base, len);
 		mp->mp_upper -= delta;
 
@@ -15333,6 +15495,205 @@ mdb_node_move(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft)
 	return MDB_SUCCESS;
 }
 
+/** Check a prefix leaf merge before changing either page. Nodes are appended
+ * to the left page, so its trunk stays unchanged. The source's compressed
+ * size does not bound its size when encoded against that destination trunk.
+ * MDB_PAGE_FULL here is only a sizing result; the transaction remains valid.
+ */
+static int
+mdb_prefix_leaf_merge_check(MDB_cursor *csrc, MDB_cursor *cdst)
+{
+	MDB_page *psrc = csrc->mc_pg[csrc->mc_top];
+	MDB_page *pdst = cdst->mc_pg[cdst->mc_top];
+	MDB_env *env = csrc->mc_txn->mt_env;
+	MDB_node *node;
+	MDB_val src_trunk, dst_trunk, key;
+	unsigned char keybuf[MDB_KEYBUF_MAX];
+	size_t room = SIZELEFT(pdst);
+	unsigned int nkeys = NUMKEYS(psrc);
+
+	/* An empty destination adopts the source trunk and encoding unchanged. */
+	if (!NUMKEYS(pdst) || !nkeys)
+		return MDB_SUCCESS;
+	node = NODEPTR(psrc, 0);
+	src_trunk = (MDB_val){node->mn_ksize, NODEKEY(psrc, node)};
+	node = NODEPTR(pdst, 0);
+	dst_trunk = (MDB_val){node->mn_ksize, NODEKEY(pdst, node)};
+	for (unsigned int i = 0; i < nkeys; ++i) {
+		size_t node_size, payload;
+		int rc;
+		node = NODEPTR(psrc, i);
+		key = src_trunk;
+		if (i) {
+			rc = mdb_leaf_decode_key(&src_trunk, NODEKEY(psrc, node),
+			    node->mn_ksize, &key, keybuf, sizeof(keybuf), 0, NULL);
+			if (rc)
+				return rc;
+		}
+		node_size = NODESIZE + EVEN(mdb_leaf_encoded_size(&dst_trunk,
+		    &key, NULL));
+		payload = NODEDSZ(node);
+		/* Match mdb_node_add: preserve overflow references and never
+		 * spill inline duplicate subpages to overflow pages.
+		 */
+		if (F_ISSET(node->mn_flags, F_BIGDATA) ||
+		    (node_size + payload > env->me_nodemax &&
+		    (node->mn_flags & (F_DUPDATA | F_SUBDATA)) != F_DUPDATA))
+			payload = sizeof(pgno_t);
+		node_size = EVEN(node_size + payload) + sizeof(indx_t);
+		if (node_size > room)
+			return MDB_PAGE_FULL;
+		room -= node_size;
+	}
+	return MDB_SUCCESS;
+}
+
+/** Check a prefix leaf borrow from the left sibling before changing either
+ * page. The sibling's last key becomes the destination's new trunk, so every
+ * destination key is re-encoded and the whole leaf can expand. MDB_PAGE_FULL
+ * here is only a sizing result; the transaction remains valid.
+ */
+static int
+mdb_prefix_leaf_move_check(MDB_cursor *csrc, MDB_cursor *cdst)
+{
+	MDB_page *psrc = csrc->mc_pg[csrc->mc_top];
+	MDB_page *pdst = cdst->mc_pg[cdst->mc_top];
+	MDB_env *env = csrc->mc_txn->mt_env;
+	MDB_node *srcnode, *dstnode;
+	MDB_val src_trunk, moved_key, dst_trunk, key;
+	unsigned char srcbuf[MDB_KEYBUF_MAX];
+	unsigned char dstbuf[MDB_KEYBUF_MAX];
+	size_t capacity, limit, used, lower_base;
+	unsigned int nkeys = NUMKEYS(pdst);
+	unsigned int src_idx;
+	unsigned int i;
+	int rc;
+
+	/* An empty destination adopts the moved key as its trunk unchanged, so
+	 * any nonempty source fits. The caller never supplies an empty source,
+	 * but guard it so src_idx cannot underflow.
+	 */
+	if (!nkeys || !NUMKEYS(psrc))
+		return MDB_SUCCESS;
+	src_idx = NUMKEYS(psrc) - 1;
+
+	srcnode = NODEPTR(psrc, 0);
+	src_trunk = (MDB_val){srcnode->mn_ksize, NODEKEY(psrc, srcnode)};
+	srcnode = NODEPTR(psrc, src_idx);
+	if (src_idx == 0) {
+		moved_key = (MDB_val){srcnode->mn_ksize, NODEKEY(psrc, srcnode)};
+	} else {
+		rc = mdb_leaf_decode_key(&src_trunk, NODEKEY(psrc, srcnode),
+		    srcnode->mn_ksize, &moved_key, srcbuf, sizeof(srcbuf), 0, NULL);
+		if (rc)
+			return rc;
+	}
+
+	capacity = mdb_prefix_page_capacity(cdst, pdst);
+	limit = (capacity > PAGEBASE) ? (capacity - PAGEBASE) : 0;
+	lower_base = (PAGEHDRSZ - PAGEBASE) + (size_t)(nkeys + 1) * sizeof(indx_t);
+	used = lower_base;
+
+	/* The moved node becomes index 0 and is stored as the new trunk. */
+	{
+		size_t key_bytes = moved_key.mv_size;
+		size_t node_size = NODESIZE + EVEN(key_bytes);
+		size_t payload;
+
+		/* Match mdb_node_add: preserve overflow references and never
+		 * spill inline duplicate subpages to overflow pages.
+		 */
+		if (F_ISSET(srcnode->mn_flags, F_BIGDATA))
+			payload = sizeof(pgno_t);
+		else if (node_size + NODEDSZ(srcnode) > env->me_nodemax &&
+		    (srcnode->mn_flags & (F_DUPDATA | F_SUBDATA)) != F_DUPDATA)
+			payload = sizeof(pgno_t);
+		else
+			payload = NODEDSZ(srcnode);
+		used += EVEN(node_size + payload);
+	}
+
+	dstnode = NODEPTR(pdst, 0);
+	dst_trunk = (MDB_val){dstnode->mn_ksize, NODEKEY(pdst, dstnode)};
+	for (i = 0; i < nkeys; ++i) {
+		size_t encoded, payload;
+
+		dstnode = NODEPTR(pdst, i);
+		if (i == 0) {
+			key = dst_trunk;
+		} else {
+			rc = mdb_leaf_decode_key(&dst_trunk, NODEKEY(pdst, dstnode),
+			    dstnode->mn_ksize, &key, dstbuf, sizeof(dstbuf), 0, NULL);
+			if (rc)
+				return rc;
+		}
+		encoded = mdb_leaf_encoded_size(&moved_key, &key, NULL);
+		payload = F_ISSET(dstnode->mn_flags, F_BIGDATA) ?
+		    sizeof(pgno_t) : NODEDSZ(dstnode);
+		used += EVEN(NODESIZE + EVEN(encoded) + payload);
+	}
+
+	if (used > limit)
+		return MDB_PAGE_FULL;
+	return MDB_SUCCESS;
+}
+
+/** Check a borrow from the right before removing its trunk. With reverse or
+ * custom key order, the source's remaining keys may take more space when
+ * encoded against the new trunk. The trunk-delete rebuild keeps each node's
+ * existing inline or overflow payload, so measure those bytes unchanged.
+ */
+static int
+mdb_prefix_leaf_right_move_check(MDB_cursor *csrc)
+{
+	MDB_page *psrc = csrc->mc_pg[csrc->mc_top];
+	MDB_node *node;
+	MDB_val old_trunk, new_trunk, key;
+	unsigned char newbuf[MDB_KEYBUF_MAX];
+	unsigned char keybuf[MDB_KEYBUF_MAX];
+	size_t capacity, limit, used;
+	unsigned int nkeys = NUMKEYS(psrc);
+	unsigned int i;
+	int rc;
+
+	if (nkeys < 2)
+		return MDB_SUCCESS;
+
+	node = NODEPTR(psrc, 0);
+	old_trunk = (MDB_val){node->mn_ksize, NODEKEY(psrc, node)};
+	node = NODEPTR(psrc, 1);
+	rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(psrc, node),
+	    node->mn_ksize, &new_trunk, newbuf, sizeof(newbuf), 0, NULL);
+	if (rc)
+		return rc;
+
+	capacity = mdb_prefix_page_capacity(csrc, psrc);
+	limit = (capacity > PAGEBASE) ? (capacity - PAGEBASE) : 0;
+	used = (PAGEHDRSZ - PAGEBASE) +
+	    (size_t)(nkeys - 1) * sizeof(indx_t);
+	for (i = 1; i < nkeys; ++i) {
+		size_t key_bytes, payload;
+
+		node = NODEPTR(psrc, i);
+		if (i == 1) {
+			key = new_trunk;
+			key_bytes = key.mv_size;
+		} else {
+			rc = mdb_leaf_decode_key(&old_trunk, NODEKEY(psrc, node),
+			    node->mn_ksize, &key, keybuf, sizeof(keybuf), 0, NULL);
+			if (rc)
+				return rc;
+			key_bytes = mdb_leaf_encoded_size(&new_trunk, &key, NULL);
+		}
+		payload = F_ISSET(node->mn_flags, F_BIGDATA) ?
+		    sizeof(pgno_t) : NODEDSZ(node);
+		used += EVEN(NODESIZE + EVEN(key_bytes) + payload);
+		if (used > limit)
+			return MDB_PAGE_FULL;
+	}
+	return MDB_SUCCESS;
+}
+
 /** Merge one page into another.
  *  The nodes from the page pointed to by \b csrc will
  *	be copied to the page pointed to by \b cdst and then
@@ -15590,6 +15951,37 @@ mdb_cursor_copy(const MDB_cursor *csrc, MDB_cursor *cdst)
 	}
 }
 
+/* Rebalance leaf decisions named unconditionally so the call sites stay
+ * self-documenting; the counters themselves are test-only.
+ */
+enum {
+	MDB_RB_MOVE_LEFT,
+	MDB_RB_MOVE_RIGHT,
+	MDB_RB_MERGE_LEFT,
+	MDB_RB_MERGE_RIGHT,
+	MDB_RB_SKIP_MOVE_LEFT,
+	MDB_RB_SKIP_MOVE_RIGHT,
+	MDB_RB_SKIP_MERGE_LEFT,
+	MDB_RB_SKIP_MERGE_RIGHT,
+	MDB_RB_PATHS
+};
+#ifdef MDB_REBALANCE_COVERAGE
+static unsigned int mdb_rebalance_paths[MDB_RB_PATHS];
+static unsigned int mdb_prefix_trunk_delete_splits;
+
+/* Count a completed prefix leaf rebalance decision. */
+static void
+mdb_rebalance_record(MDB_cursor *mc, unsigned int path)
+{
+	MDB_page *mp = mc->mc_pg[mc->mc_top];
+	if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+	    IS_LEAF(mp) && !IS_LEAF2(mp))
+		mdb_rebalance_paths[path]++;
+}
+#else
+#define mdb_rebalance_record(mc, path) ((void)0)
+#endif
+
 /** Rebalance the tree after a delete operation.
  * @param[in] mc Cursor pointing to the page where rebalancing
  * should begin.
@@ -15599,7 +15991,7 @@ static int
 mdb_rebalance(MDB_cursor *mc)
 {
 	MDB_node	*node;
-	int rc, fromleft;
+	int rc, fromleft, move_candidate;
 	unsigned int ptop, minkeys, thresh;
 	MDB_cursor	mn;
 	indx_t oldki;
@@ -15755,13 +16147,67 @@ mdb_rebalance(MDB_cursor *mc)
 	 * move one key from it. Otherwise we should try to merge them.
 	 * (A branch page must never have less than 2 keys.)
 	 */
-	if (PAGEFILL(mc->mc_txn->mt_env, mn.mc_pg[mn.mc_top]) >= thresh && NUMKEYS(mn.mc_pg[mn.mc_top]) > minkeys) {
-	rc = mdb_node_move(&mn, mc, fromleft);
+	move_candidate = PAGEFILL(mc->mc_txn->mt_env,
+	    mn.mc_pg[mn.mc_top]) >= thresh &&
+	    NUMKEYS(mn.mc_pg[mn.mc_top]) > minkeys;
+	if (move_candidate) {
+		MDB_page *mp = mc->mc_pg[mc->mc_top];
+		/* Left borrow can expand the destination; right borrow can expand
+		 * its source after the source trunk is removed. A nonempty leaf
+		 * may remain below the fill target when the move cannot fit.
+		 */
+		if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+		    IS_LEAF(mp) && !IS_LEAF2(mp)) {
+			rc = fromleft ? mdb_prefix_leaf_move_check(&mn, mc) :
+			    mdb_prefix_leaf_right_move_check(&mn);
+			if (rc) {
+				mc->mc_ki[mc->mc_top] = oldki;
+				if (rc == MDB_PAGE_FULL) {
+					if (NUMKEYS(mp) >= minkeys) {
+						mdb_rebalance_record(mc, fromleft ?
+						    MDB_RB_SKIP_MOVE_LEFT : MDB_RB_SKIP_MOVE_RIGHT);
+						return MDB_SUCCESS;
+					}
+					/* An empty leaf must be removed; merging the right
+					 * source into it preserves the source encoding.
+					 */
+					move_candidate = 0;
+				} else {
+					return rc;
+				}
+			}
+		}
+	}
+	if (move_candidate) {
+		rc = mdb_node_move(&mn, mc, fromleft);
+		if (rc == MDB_SUCCESS)
+			mdb_rebalance_record(mc, fromleft ?
+			    MDB_RB_MOVE_LEFT : MDB_RB_MOVE_RIGHT);
 		if (fromleft) {
 			/* if we inserted on left, bump position up */
 			oldki++;
 		}
 	} else {
+		MDB_page *mp = mc->mc_pg[mc->mc_top];
+		if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+		    IS_LEAF(mp) && !IS_LEAF2(mp)) {
+			rc = fromleft ? mdb_prefix_leaf_merge_check(mc, &mn) :
+			    mdb_prefix_leaf_merge_check(&mn, mc);
+			if (rc) {
+				mc->mc_ki[mc->mc_top] = oldki;
+				/* Nonempty leaves may stay below the fill target when
+				 * their merged encoding does not fit. Empty leaves
+				 * always fit and must still be removed.
+				 */
+				if (rc == MDB_PAGE_FULL) {
+					mdb_cassert(mc, NUMKEYS(mp) >= minkeys);
+					mdb_rebalance_record(mc, fromleft ?
+					    MDB_RB_SKIP_MERGE_LEFT : MDB_RB_SKIP_MERGE_RIGHT);
+					return MDB_SUCCESS;
+				}
+				return rc;
+			}
+		}
 		if (!fromleft) {
 			rc = mdb_page_merge(&mn, mc);
 		} else {
@@ -15772,9 +16218,65 @@ mdb_rebalance(MDB_cursor *mc)
 				rc = mdb_page_merge(mc, &mn));
 			mdb_cursor_copy(&mn, mc);
 		}
+		if (rc == MDB_SUCCESS)
+			mdb_rebalance_record(mc, fromleft ?
+			    MDB_RB_MERGE_LEFT : MDB_RB_MERGE_RIGHT);
 		mc->mc_flags &= ~C_EOF;
 	}
 	mc->mc_ki[mc->mc_top] = oldki;
+	return rc;
+}
+
+/** Split a prefix leaf before deleting a trunk whose replacement encoding
+ * would overflow the page. Reinsert an existing middle node so the split
+ * preserves every entry and the usual split cursor/count fixups apply.
+ */
+static int
+mdb_prefix_split_before_trunk_delete(MDB_cursor *mc)
+{
+	MDB_page *mp = mc->mc_pg[mc->mc_top];
+	MDB_cursor mn = (MDB_cursor){0};
+	MDB_node *node;
+	MDB_val key, data;
+	unsigned char keybuf[MDB_KEYBUF_MAX];
+	void *payload;
+	unsigned int flags;
+	indx_t index = NUMKEYS(mp) / 2;
+	size_t bytes;
+	int rc;
+
+	if (index == 0 || IS_SUBP(mp))
+		return MDB_PAGE_FULL;
+	mdb_cursor_copy(mc, &mn);
+	mn.mc_xcursor = NULL;
+	mn.mc_ki[mn.mc_top] = index;
+	rc = mdb_cursor_read_key_at(&mn, mp, index, &key);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	if (key.mv_size > sizeof(keybuf))
+		return MDB_BAD_VALSIZE;
+	memcpy(keybuf, key.mv_data, key.mv_size);
+	key.mv_data = keybuf;
+
+	node = NODEPTR(mp, index);
+	data.mv_size = NODEDSZ(node);
+	flags = node->mn_flags | MDB_SPLIT_REPLACE;
+	bytes = (flags & F_BIGDATA) ? sizeof(pgno_t) : data.mv_size;
+	payload = malloc(bytes ? bytes : 1);
+	if (!payload)
+		return ENOMEM;
+	if (bytes)
+		memcpy(payload, NODEDATA(node), bytes);
+	data.mv_data = payload;
+
+	/* A nontrunk deletion cannot change the page's prefix encoding.
+	 * MDB_SPLIT_REPLACE keeps cursors at this logical index while the
+	 * saved node is reinserted across the split.
+	 */
+	mdb_node_del(&mn, 0);
+	WITH_CURSOR_TRACKING(mn,
+		rc = mdb_page_split(&mn, &key, &data, P_INVALID, flags));
+	free(payload);
 	return rc;
 }
 
@@ -15794,7 +16296,12 @@ mdb_cursor_del0(MDB_cursor *mc)
 	indx_t parent_idx = 0;
 	uint64_t parent_before = 0;
 	int have_direct_parent = 0;
+	int preflight_full;
+	unsigned char old_trunk_buf[MDB_KEYBUF_MAX];
+	MDB_val old_trunk;
 
+retry_delete:
+	have_direct_parent = 0;
 	ki = mc->mc_ki[mc->mc_top];
 	mp = mc->mc_pg[mc->mc_top];
 	uint64_t prior_total = 0;
@@ -15819,7 +16326,35 @@ mdb_cursor_del0(MDB_cursor *mc)
 			}
 		}
 	}
-	mdb_node_del(mc, mc->mc_db->md_pad);
+	if ((mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) &&
+	    IS_LEAF(mp) && !IS_LEAF2(mp) && ki == 0) {
+		MDB_node *first = NODEPTR(mp, 0);
+		if (first->mn_ksize > sizeof(old_trunk_buf)) {
+			rc = MDB_BAD_VALSIZE;
+			goto fail;
+		}
+		old_trunk.mv_size = first->mn_ksize;
+		old_trunk.mv_data = old_trunk_buf;
+		memcpy(old_trunk_buf, NODEKEY(mp, first), old_trunk.mv_size);
+		rc = mdb_leaf_rebuild_after_trunk_delete(mc, mp, 0,
+		    &old_trunk, &preflight_full);
+		if (rc == MDB_PAGE_FULL && preflight_full &&
+		    !IS_SUBP(mp) && NUMKEYS(mp) > 1) {
+			rc = mdb_prefix_split_before_trunk_delete(mc);
+			if (rc != MDB_SUCCESS)
+				goto fail;
+#ifdef MDB_REBALANCE_COVERAGE
+			mdb_prefix_trunk_delete_splits++;
+#endif
+			goto retry_delete;
+		}
+		if (rc == MDB_PAGE_FULL && preflight_full && IS_SUBP(mp))
+			return rc;
+		if (rc != MDB_SUCCESS)
+			goto fail;
+	} else {
+		mdb_node_del(mc, mc->mc_db->md_pad);
+	}
 	mc->mc_db->md_entries--;
 	if (counted && mc->mc_top > 0) {
 		uint64_t leaf_after = prior_total;

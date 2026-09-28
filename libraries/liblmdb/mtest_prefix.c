@@ -107,6 +107,7 @@ static void test_prefix_dupsort_corner_cases(void);
 static void assert_dup_sequence(MDB_env *env, MDB_dbi dbi, const char *key,
     const char *const *expected, size_t expected_count);
 static void test_prefix_dupsort_inline_basic_ops(void);
+static void test_prefix_dupsort_inline_trunk_delete_growth(void);
 static void test_prefix_dupsort_inline_promote(void);
 static void test_prefix_dupsort_inline_cmp_negative(void);
 static void test_prefix_dupsort_trunk_swap_inline(void);
@@ -1735,14 +1736,15 @@ test_prefix_overflow_trunk_reencode_regression(void)
  * number, even though mdb_node_add did not allocate an overflow page.
  */
 static void
-overflow_rebalance_verify(MDB_env *env, MDB_dbi dbi, unsigned int remaining,
-    unsigned char *expected, size_t value_size)
+overflow_rebalance_verify(MDB_env *env, MDB_dbi dbi, unsigned int first,
+	unsigned int remaining,
+    unsigned char *expected, size_t key_size, size_t value_size)
 {
 	MDB_txn *txn;
 	MDB_cursor *cur;
 	MDB_stat stat;
 	MDB_val key = {0, NULL}, data = {0, NULL};
-	unsigned char keybuf[128];
+	unsigned char keybuf[256];
 	int rc;
 
 	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
@@ -1754,11 +1756,11 @@ overflow_rebalance_verify(MDB_env *env, MDB_dbi dbi, unsigned int remaining,
 	}
 	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
 	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
-	for (unsigned int i = 0; i < remaining; ++i) {
-		memset(keybuf, i, sizeof(keybuf));
+	for (unsigned int i = first; i < first + remaining; ++i) {
+		memset(keybuf, i, key_size);
 		memset(expected, i, value_size);
-		if (rc != MDB_SUCCESS || key.mv_size != sizeof(keybuf) ||
-		    memcmp(key.mv_data, keybuf, sizeof(keybuf)) ||
+		if (rc != MDB_SUCCESS || key.mv_size != key_size ||
+		    memcmp(key.mv_data, keybuf, key_size) ||
 		    data.mv_size != value_size ||
 		    memcmp(data.mv_data, expected, value_size)) {
 			fprintf(stderr, "overflow rebalance: changed surviving row %u\n", i);
@@ -1817,7 +1819,8 @@ test_prefix_overflow_rebalance_regression(void)
 			CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
 		}
 		mdb_txn_abort(txn);
-		overflow_rebalance_verify(env, dbi, 256, value, value_size);
+		overflow_rebalance_verify(env, dbi, 0, 256, value,
+		    sizeof(keybuf), value_size);
 
 		/* Descending deletes borrow an overflow node from the left sibling
 		 * into slot zero of the remaining right leaf, replacing its trunk.
@@ -1838,13 +1841,1273 @@ test_prefix_overflow_rebalance_regression(void)
 				CHECK_CALL(mdb_dbi_open(txn, name, flags, &dbi));
 				CHECK_CALL(mdb_txn_commit(txn));
 			}
-			overflow_rebalance_verify(env, dbi, i, value, value_size);
+			overflow_rebalance_verify(env, dbi, 0, i, value,
+			    sizeof(keybuf), value_size);
 		}
 		free(value);
 		mdb_env_close(env);
 		cleanup_env_dir(dir);
 	}
 }
+
+/* Ascending deletes underfill the leftmost leaf. Verify right-sibling
+ * borrowing and merging with the same large-value workload as above.
+ */
+static void
+test_prefix_overflow_ascending_rebalance(void)
+{
+	static const char *dir = "testdb_prefix_overflow_ascending";
+	static const char *name = "overflow-ascending";
+	enum { ASC_KEYS = 256 };
+
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		unsigned char keybuf[256];
+		MDB_val key = {0, keybuf};
+		unsigned int flags = MDB_PREFIX_COMPRESSION |
+		    (counted ? MDB_COUNTED : 0);
+
+		CHECK_CALL(mdb_env_stat(env, &stat));
+		key.mv_size = stat.ms_psize >= 32768 ? 256 : 128;
+		size_t value_size = (size_t)stat.ms_psize * 2;
+		unsigned char *value = malloc(value_size);
+		if (!value)
+			die_errno("malloc ascending rebalance value");
+		MDB_val data = {value_size, value};
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, name, MDB_CREATE | flags, &dbi));
+		for (unsigned int i = 0; i < ASC_KEYS; ++i) {
+			memset(keybuf, i, key.mv_size);
+			memset(value, i, value_size);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_depth < 2) {
+			fprintf(stderr, "ascending rebalance: expected multiple leaves\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		for (unsigned int i = 0; i < ASC_KEYS; ++i) {
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+			memset(keybuf, i, key.mv_size);
+			CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+			CHECK_CALL(mdb_txn_commit(txn));
+			overflow_rebalance_verify(env, dbi, i + 1, ASC_KEYS - i - 1,
+			    value, key.mv_size, value_size);
+		}
+		free(value);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+/* Raw-byte reproduction of a merge between unrelated prefix groups. The
+ * long-key leaf is sparse in its own encoding, but cannot fit in its left
+ * sibling when its keys are encoded against that sibling's short trunk.
+ * Size the groups to occupy adjacent leaves at each database page size.
+ */
+static unsigned int pm_group_size;
+#define PM_KEY_SIZE 511
+
+static void
+prefix_merge_set_group_size(MDB_env *env)
+{
+	MDB_stat stat;
+	CHECK_CALL(mdb_env_stat(env, &stat));
+	if (stat.ms_psize <= 4096)
+		pm_group_size = 16;
+	else if (stat.ms_psize >= 32768)
+		pm_group_size = 192;
+	else
+		pm_group_size = 32;
+}
+
+static MDB_val
+prefix_merge_key(unsigned char *buf, unsigned int group, unsigned int id)
+{
+	static const char shared[] = "shared-prefix-";
+	size_t size = group == 6 ? PM_KEY_SIZE : 15;
+	size_t id_offset = group == 6 ? 502 : 5;
+
+	memset(buf, 0, size);
+	buf[3] = (unsigned char)group;
+	if (group == 6) {
+		buf[4] = 0xfa;
+		for (size_t i = 0; i < 496; ++i)
+			buf[5 + i] = shared[i % (sizeof(shared) - 1)];
+		buf[501] = 0xff;
+		buf[510] = 2;
+	} else {
+		buf[4] = 0xc1;
+		buf[14] = 1;
+	}
+	buf[id_offset + 6] = (unsigned char)(id >> 8);
+	buf[id_offset + 7] = (unsigned char)id;
+	return (MDB_val){size, buf};
+}
+
+static void
+prefix_merge_verify(MDB_txn *txn, MDB_dbi dbi, unsigned int replaced,
+	unsigned int short_deleted, unsigned int short_total)
+{
+	MDB_cursor *cur;
+	MDB_stat stat;
+	MDB_val key, data;
+	unsigned char keybuf[PM_KEY_SIZE], value[8] = {0};
+	uint64_t count;
+	unsigned int flags;
+	unsigned int total = short_total + 2 * pm_group_size - short_deleted;
+
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	CHECK_CALL(mdb_dbi_flags(txn, dbi, &flags));
+	count = pm_group_size;
+	if (flags & MDB_COUNTED) {
+		unsigned char upperbuf[PM_KEY_SIZE];
+		MDB_val low = prefix_merge_key(keybuf, 6, 0);
+		MDB_val high = prefix_merge_key(upperbuf, 6, 2 * pm_group_size + 1);
+		CHECK_CALL(mdb_range_count_values(txn, dbi, &low, &high, 0, &count));
+	}
+	if (stat.ms_entries != total || count != pm_group_size) {
+		fprintf(stderr, "prefix merge: incorrect entry count\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	/* Check every key and value in both directions, including duplicates. */
+	for (unsigned int reverse = 0; reverse < 2; ++reverse) {
+		for (unsigned int step = 0; step < total; ++step) {
+			unsigned int row = short_deleted +
+			    (reverse ? total - 1 - step : step);
+			unsigned int group, id, val;
+			if (row < short_total) {
+				group = 5;
+				id = row;
+				val = row + 1;
+			} else if (row < short_total + pm_group_size) {
+				group = 6;
+				id = row - short_total + replaced + 1;
+				val = (id - 1) % pm_group_size + 1;
+			} else {
+				unsigned int dup = row - short_total - pm_group_size;
+				group = 7;
+				id = dup >= pm_group_size - replaced;
+				val = id ? dup - (pm_group_size - replaced) + 1 :
+				    dup + replaced + 1;
+			}
+			MDB_val expected = prefix_merge_key(keybuf, group, id);
+			value[7] = (unsigned char)val;
+			CHECK_CALL(mdb_cursor_get(cur, &key, &data, step ?
+			    (reverse ? MDB_PREV : MDB_NEXT) :
+			    (reverse ? MDB_LAST : MDB_FIRST)));
+			if (key.mv_size != expected.mv_size ||
+			    memcmp(key.mv_data, expected.mv_data, key.mv_size) ||
+			    data.mv_size != sizeof(value) ||
+			    memcmp(data.mv_data, value, sizeof(value))) {
+				fprintf(stderr, "prefix merge: changed row %u after %u replacements\n",
+				    row, replaced);
+				exit(EXIT_FAILURE);
+			}
+		}
+		if (mdb_cursor_get(cur, &key, &data,
+		    reverse ? MDB_PREV : MDB_NEXT) != MDB_NOTFOUND) {
+			fprintf(stderr, "prefix merge: unexpected remaining row\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	mdb_cursor_close(cur);
+}
+
+/* Keep cursors on both siblings while the delete cursor merges or borrows.
+ * A fresh scan alone would not catch a stale live cursor after rebalance.
+ */
+static MDB_cursor *
+prefix_merge_watch(MDB_txn *txn, MDB_dbi dbi, unsigned int group,
+	unsigned int id, unsigned int value_id)
+{
+	MDB_cursor *cur;
+	unsigned char keybuf[PM_KEY_SIZE], value[8] = {0};
+	MDB_val key = prefix_merge_key(keybuf, group, id);
+	MDB_val data = {sizeof(value), value};
+	value[7] = (unsigned char)value_id;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_GET_BOTH));
+	return cur;
+}
+
+static void
+prefix_merge_check_watch(MDB_cursor *cur, unsigned int group,
+	unsigned int id, unsigned int value_id)
+{
+	unsigned char keybuf[PM_KEY_SIZE], value[8] = {0};
+	MDB_val expected = prefix_merge_key(keybuf, group, id);
+	MDB_val key = {0, NULL}, data = {0, NULL};
+	value[7] = (unsigned char)value_id;
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_GET_CURRENT));
+	if (key.mv_size != expected.mv_size ||
+	    memcmp(key.mv_data, expected.mv_data, key.mv_size) ||
+	    data.mv_size != sizeof(value) ||
+	    memcmp(data.mv_data, value, sizeof(value))) {
+		fprintf(stderr, "prefix rebalance: live cursor changed at group %u id %u\n",
+		    group, id);
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void
+test_prefix_merge_capacity_regression(void)
+{
+	static const char *dir = "testdb_prefix_merge_capacity";
+	static const char *name = "merge-capacity";
+
+	/* Include the uncompressed control and counted branch metadata. */
+	for (unsigned int mode = 0; mode < 4; ++mode) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		unsigned char keybuf[PM_KEY_SIZE], value[8] = {0};
+		MDB_val key, data = {sizeof(value), value};
+		unsigned int flags = MDB_DUPSORT | MDB_DUPFIXED |
+		    ((mode & 1) ? MDB_PREFIX_COMPRESSION : 0) |
+		    ((mode & 2) ? MDB_COUNTED : 0);
+		prefix_merge_set_group_size(env);
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, name, MDB_CREATE | flags, &dbi));
+		for (unsigned int group = 5; group <= 7; ++group) {
+			for (unsigned int i = 1; i <= pm_group_size; ++i) {
+				key = prefix_merge_key(keybuf, group,
+				    group == 5 ? i - 1 : (group == 6 ? i : 0));
+				value[7] = (unsigned char)i;
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			}
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		/* Underfill the leftmost leaf as well, so rebalance considers
+		 * appending its right neighbor instead of merging to the left.
+		 */
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		for (unsigned int i = 0; i < pm_group_size; ++i) {
+			key = prefix_merge_key(keybuf, 5, i);
+			CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+			prefix_merge_verify(txn, dbi, 0, i + 1, pm_group_size);
+		}
+		mdb_txn_abort(txn);
+
+		/* First abort the replacements, then repeat and commit them. */
+		for (unsigned int commit = 0; commit < 2; ++commit) {
+			MDB_cursor *short_watch, *long_watch;
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+			prefix_merge_verify(txn, dbi, 0, 0, pm_group_size);
+			short_watch = prefix_merge_watch(txn, dbi, 5, pm_group_size - 1,
+			    pm_group_size);
+			long_watch = prefix_merge_watch(txn, dbi, 6, pm_group_size,
+			    pm_group_size);
+			for (unsigned int i = 1; i <= pm_group_size; ++i) {
+				if (i == pm_group_size) {
+					mdb_cursor_close(long_watch);
+					long_watch = NULL;
+				}
+				value[7] = (unsigned char)i;
+				key = prefix_merge_key(keybuf, 7, 0);
+				CHECK_CALL(mdb_del(txn, dbi, &key, &data));
+				key = prefix_merge_key(keybuf, 7, 1);
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+				key = prefix_merge_key(keybuf, 6, i);
+				CHECK_CALL(mdb_del(txn, dbi, &key, &data));
+				key = prefix_merge_key(keybuf, 6, pm_group_size + i);
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+				prefix_merge_verify(txn, dbi, i, 0, pm_group_size);
+				prefix_merge_check_watch(short_watch, 5, pm_group_size - 1,
+				    pm_group_size);
+				if (long_watch)
+					prefix_merge_check_watch(long_watch, 6,
+					    pm_group_size, pm_group_size);
+			}
+			mdb_cursor_close(short_watch);
+			if (commit)
+				CHECK_CALL(mdb_txn_commit(txn));
+			else
+				mdb_txn_abort(txn);
+		}
+		mdb_env_close(env);
+		CHECK_CALL(mdb_env_create(&env));
+		CHECK_CALL(mdb_env_set_maxdbs(env, 4));
+		CHECK_CALL(mdb_env_open(env, dir, MDB_NOLOCK, 0664));
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, name, flags, &dbi));
+		prefix_merge_verify(txn, dbi, pm_group_size, 0, pm_group_size);
+		/* Deferred merges must still allow empty leaves and the root to be
+		 * reclaimed. Delete from opposite ends in the two prefix modes.
+		 */
+		MDB_cursor *cur;
+		CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+		for (unsigned int i = 0; i < 3 * pm_group_size; ++i) {
+			CHECK_CALL(mdb_cursor_get(cur, &key, &data,
+			    (mode & 2) ? MDB_LAST : MDB_FIRST));
+			CHECK_CALL(mdb_cursor_del(cur, 0));
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_entries || stat.ms_leaf_pages || stat.ms_depth) {
+			fprintf(stderr, "prefix merge: failed to empty tree\n");
+			exit(EXIT_FAILURE);
+		}
+		mdb_cursor_close(cur);
+		CHECK_CALL(mdb_txn_commit(txn));
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+/* A full short-key left sibling lends one key to an underfilled long-key
+ * right leaf. If that key becomes the right leaf's trunk, re-encoding all
+ * the 511-byte keys can exceed the page even though a single node fits. The
+ * group size scales with the database page size to preserve this condition.
+ * mtest_prefix_rebalance asserts the oversized-move skip path is reached.
+ * This differs from the whole-page merge case above.
+ */
+static void
+test_prefix_borrow_capacity_regression(void)
+{
+	static const char *dir = "testdb_prefix_borrow_capacity";
+	static const char *name = "borrow-capacity";
+
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env(dir);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		unsigned char keybuf[PM_KEY_SIZE], value[8] = {0};
+		MDB_val key, data = {sizeof(value), value};
+		unsigned int short_keys;
+		unsigned int flags = MDB_PREFIX_COMPRESSION | MDB_DUPSORT |
+		    MDB_DUPFIXED | (counted ? MDB_COUNTED : 0);
+		prefix_merge_set_group_size(env);
+		CHECK_CALL(mdb_env_stat(env, &stat));
+		short_keys = (unsigned int)(stat.ms_psize / 64);
+		if (short_keys < 256)
+			short_keys = 256;
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, name, MDB_CREATE | flags, &dbi));
+		for (unsigned int i = 0; i < short_keys; ++i) {
+			key = prefix_merge_key(keybuf, 5, i);
+			value[7] = (unsigned char)(i + 1);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		for (unsigned int i = 1; i <= pm_group_size; ++i) {
+			key = prefix_merge_key(keybuf, 6, i);
+			value[7] = (unsigned char)i;
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		for (unsigned int i = 1; i <= pm_group_size; ++i) {
+			key = prefix_merge_key(keybuf, 7, 0);
+			value[7] = (unsigned char)i;
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_depth < 2) {
+			fprintf(stderr, "prefix borrow: expected multiple leaves\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		MDB_cursor *short_watch = prefix_merge_watch(txn, dbi, 5,
+		    short_keys - 1, short_keys);
+		MDB_cursor *long_watch = prefix_merge_watch(txn, dbi, 6,
+		    pm_group_size, pm_group_size);
+		for (unsigned int i = 1; i <= pm_group_size; ++i) {
+			int rc;
+			if (i == pm_group_size) {
+				mdb_cursor_close(long_watch);
+				long_watch = NULL;
+			}
+			value[7] = (unsigned char)i;
+			key = prefix_merge_key(keybuf, 7, 0);
+			CHECK_CALL(mdb_del(txn, dbi, &key, &data));
+			key = prefix_merge_key(keybuf, 7, 1);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			key = prefix_merge_key(keybuf, 6, i);
+			rc = mdb_del(txn, dbi, &key, &data);
+			if (rc)
+				fprintf(stderr, "prefix borrow: deleting long key %u\n", i);
+			CHECK(rc, "delete long key during prefix borrow");
+			key = prefix_merge_key(keybuf, 6, pm_group_size + i);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			prefix_merge_verify(txn, dbi, i, 0, short_keys);
+			prefix_merge_check_watch(short_watch, 5,
+			    short_keys - 1, short_keys);
+			if (long_watch)
+				prefix_merge_check_watch(long_watch, 6,
+				    pm_group_size, pm_group_size);
+		}
+		mdb_cursor_close(short_watch);
+		CHECK_CALL(mdb_txn_commit(txn));
+		CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+		prefix_merge_verify(txn, dbi, pm_group_size, 0, short_keys);
+		mdb_txn_abort(txn);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+/* A right borrow removes the source leaf's trunk. With reverse-key ordering,
+ * its second key can differ at byte zero from every later key. Making that
+ * key the new trunk can expand the source beyond one page. This fixture uses
+ * the white-box cursor to select the actual second key of the right leaf.
+ */
+#ifdef MDB_REBALANCE_COVERAGE
+static MDB_val
+prefix_reverse_borrow_key(unsigned int id, int special,
+	unsigned char keybuf[256])
+{
+	memset(keybuf, 'A', 256);
+	if (special)
+		keybuf[0] = 'B';
+	keybuf[254] = (unsigned char)id;
+	keybuf[255] = (unsigned char)(id >> 8);
+	return (MDB_val){256, keybuf};
+}
+
+static void
+prefix_reverse_borrow_value(unsigned int id, unsigned char value[8])
+{
+	memset(value, 0, 8);
+	value[0] = (unsigned char)id;
+	value[1] = (unsigned char)(id >> 8);
+	value[7] = 0x5a;
+}
+
+static void
+prefix_reverse_borrow_verify(MDB_env *env, MDB_dbi dbi,
+	unsigned int first, unsigned int total, unsigned int special)
+{
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_stat stat;
+	MDB_val key, data;
+	unsigned char keybuf[256], value[8];
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_entries != total - first) {
+		fprintf(stderr, "reverse borrow: incorrect entry count\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	for (unsigned int id = first; id < total; ++id) {
+		MDB_val expected = prefix_reverse_borrow_key(id, id == special,
+		    keybuf);
+		prefix_reverse_borrow_value(id, value);
+		if (rc != MDB_SUCCESS || key.mv_size != expected.mv_size ||
+		    memcmp(key.mv_data, expected.mv_data, expected.mv_size) ||
+		    data.mv_size != sizeof(value) ||
+		    memcmp(data.mv_data, value, sizeof(value))) {
+			fprintf(stderr, "reverse borrow: changed row %u\n", id);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "reverse borrow: unexpected remaining row\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static unsigned int
+prefix_reverse_borrow_first_right(MDB_env *env, MDB_dbi dbi)
+{
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_page *left_leaf, *right_leaf;
+	MDB_val key, data;
+	unsigned int first_right, second_right;
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_FIRST));
+	if (cur->mc_top == 0) {
+		fprintf(stderr, "reverse borrow: expected multiple leaves\n");
+		exit(EXIT_FAILURE);
+	}
+	left_leaf = cur->mc_pg[cur->mc_top];
+	do {
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	} while (rc == MDB_SUCCESS && cur->mc_pg[cur->mc_top] == left_leaf);
+	if (rc != MDB_SUCCESS || cur->mc_ki[cur->mc_top] != 0 ||
+	    key.mv_size != 256) {
+		fprintf(stderr, "reverse borrow: failed to locate right leaf\n");
+		exit(EXIT_FAILURE);
+	}
+	right_leaf = cur->mc_pg[cur->mc_top];
+	first_right = ((unsigned char *)key.mv_data)[254] |
+	    ((unsigned int)((unsigned char *)key.mv_data)[255] << 8);
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_NEXT));
+	if (cur->mc_pg[cur->mc_top] != right_leaf ||
+	    cur->mc_ki[cur->mc_top] != 1 || key.mv_size != 256) {
+		fprintf(stderr, "reverse borrow: right leaf has no second key\n");
+		exit(EXIT_FAILURE);
+	}
+	second_right = ((unsigned char *)key.mv_data)[254] |
+	    ((unsigned int)((unsigned char *)key.mv_data)[255] << 8);
+	if (second_right != first_right + 1) {
+		fprintf(stderr, "reverse borrow: right leaf keys are not consecutive\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	return first_right;
+}
+
+static void
+test_prefix_reverse_borrow_capacity_regression(void)
+{
+	static const char *dir = "testdb_prefix_reverse_borrow";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn;
+	MDB_dbi dbi;
+	MDB_stat stat;
+	unsigned char keybuf[256], value[8];
+	MDB_val key, data = {sizeof(value), value};
+	unsigned int split_at = UINT_MAX, first_right, total = 0, extra, limit;
+	unsigned int special, delete_count;
+
+	CHECK_CALL(mdb_env_stat(env, &stat));
+	extra = (unsigned int)(stat.ms_psize / 64);
+	limit = (unsigned int)(stat.ms_psize / 12 + 128);
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL,
+	    MDB_PREFIX_COMPRESSION | MDB_REVERSEKEY, &dbi));
+	for (unsigned int id = 0; id < limit; ++id) {
+		key = prefix_reverse_borrow_key(id, 0, keybuf);
+		prefix_reverse_borrow_value(id, value);
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		if (split_at == UINT_MAX) {
+			CHECK_CALL(mdb_stat(txn, dbi, &stat));
+			if (stat.ms_leaf_pages > 1)
+				split_at = id;
+		}
+		if (split_at != UINT_MAX && id >= split_at + extra) {
+			total = id + 1;
+			break;
+		}
+	}
+	if (!total) {
+		fprintf(stderr, "reverse borrow: failed to create two leaves\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	first_right = prefix_reverse_borrow_first_right(env, dbi);
+
+	/* The second key of the right leaf becomes its new trunk on a borrow. */
+	special = first_right + 1;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	key = prefix_reverse_borrow_key(special, 0, keybuf);
+	CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+	key = prefix_reverse_borrow_key(special, 1, keybuf);
+	prefix_reverse_borrow_value(special, value);
+	CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	CHECK_CALL(mdb_txn_commit(txn));
+	prefix_reverse_borrow_verify(env, dbi, 0, total, special);
+
+	/* Stop with a nonempty left leaf, after it has fallen below 25% fill. */
+	delete_count = first_right - first_right / 10;
+	for (unsigned int id = 0; id < delete_count; ++id) {
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		key = prefix_reverse_borrow_key(id, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		CHECK_CALL(mdb_txn_commit(txn));
+	}
+	prefix_reverse_borrow_verify(env, dbi, delete_count, total, special);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+
+/* Deleting the trunk directly must make room for the new trunk's encoding.
+ * With reverse-key order, the second key differs at byte zero, while all
+ * later keys shared the old trunk's long prefix. The values live on overflow
+ * pages so the leaf layout is independent of their payload length.
+ */
+static void
+prefix_reverse_delete_value(unsigned int id, unsigned char *value, size_t len)
+{
+	memset(value, (unsigned char)(id ^ 0x5a), len);
+	value[0] = (unsigned char)id;
+	value[1] = (unsigned char)(id >> 8);
+}
+
+static void
+prefix_reverse_delete_verify(MDB_env *env, MDB_dbi dbi,
+	unsigned int total, unsigned int deleted, unsigned int special,
+	size_t value_len, int counted, int overflow_values)
+{
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_stat stat;
+	MDB_val key, data;
+	unsigned char keybuf[256];
+	unsigned char *expected_value = malloc(value_len);
+	int rc;
+
+	if (!expected_value)
+		die_errno("malloc reverse delete value");
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_entries != total - (deleted != UINT_MAX) ||
+	    (overflow_values && stat.ms_overflow_pages != stat.ms_entries)) {
+		fprintf(stderr, "reverse delete: incorrect entries or overflow pages\n");
+		exit(EXIT_FAILURE);
+	}
+	if (counted) {
+		uint64_t count;
+		CHECK_CALL(mdb_count_all(txn, dbi, 0, &count));
+		if (count != stat.ms_entries) {
+			fprintf(stderr, "reverse delete: incorrect counted total\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	for (unsigned int id = 0; id < total; ++id) {
+		MDB_val expected;
+		if (id == deleted)
+			continue;
+		expected = prefix_reverse_borrow_key(id, id == special, keybuf);
+		prefix_reverse_delete_value(id, expected_value, value_len);
+		if (rc != MDB_SUCCESS || key.mv_size != expected.mv_size ||
+		    memcmp(key.mv_data, expected.mv_data, expected.mv_size) ||
+		    data.mv_size != value_len ||
+		    memcmp(data.mv_data, expected_value, value_len)) {
+			fprintf(stderr, "reverse delete: changed row %u\n", id);
+			exit(EXIT_FAILURE);
+		}
+		rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+	}
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "reverse delete: unexpected remaining row\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	free(expected_value);
+}
+
+static MDB_cursor *
+prefix_reverse_delete_watch(MDB_txn *txn, MDB_dbi dbi,
+	unsigned int id, int special)
+{
+	MDB_cursor *cur;
+	unsigned char keybuf[256];
+	MDB_val key = prefix_reverse_borrow_key(id, special, keybuf);
+	MDB_val data;
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_SET));
+	return cur;
+}
+
+static void
+prefix_reverse_delete_check_watch(MDB_cursor *cur,
+	unsigned int id, int special, size_t value_len, MDB_cursor_op op)
+{
+	unsigned char keybuf[256];
+	unsigned char *expected_value = malloc(value_len);
+	MDB_val expected = prefix_reverse_borrow_key(id, special, keybuf);
+	MDB_val key = {0, NULL}, data = {0, NULL};
+	if (!expected_value)
+		die_errno("malloc reverse delete watch value");
+	prefix_reverse_delete_value(id, expected_value, value_len);
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, op));
+	if (key.mv_size != expected.mv_size ||
+	    memcmp(key.mv_data, expected.mv_data, expected.mv_size) ||
+	    data.mv_size != value_len ||
+	    memcmp(data.mv_data, expected_value, value_len)) {
+		fprintf(stderr, "reverse delete: live cursor changed at row %u\n", id);
+		exit(EXIT_FAILURE);
+	}
+	free(expected_value);
+}
+
+static void
+test_prefix_reverse_trunk_delete_overflow_regression(void)
+{
+	static const char *dir = "testdb_prefix_reverse_trunk_delete";
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env_with_mapsize(dir,
+		    512UL * 1024 * 1024);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		MDB_cursor *left_watch, *pivot_watch, *right_watch;
+		unsigned char keybuf[256];
+		unsigned char *value;
+		MDB_val key, data;
+		unsigned int split_at = UINT_MAX, first_right;
+		unsigned int total = 0, extra, limit;
+		mdb_size_t overflow_before;
+		size_t value_len;
+
+		CHECK_CALL(mdb_env_stat(env, &stat));
+		value_len = stat.ms_psize / 2 + 512;
+		value = malloc(value_len);
+		if (!value)
+			die_errno("malloc reverse delete overflow value");
+		data.mv_size = value_len;
+		data.mv_data = value;
+		extra = (unsigned int)(stat.ms_psize / 64);
+		limit = (unsigned int)(stat.ms_psize / 8 + 256);
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION |
+		    MDB_REVERSEKEY | (counted ? MDB_COUNTED : 0), &dbi));
+		for (unsigned int id = 0; id < limit; ++id) {
+			key = prefix_reverse_borrow_key(id, 0, keybuf);
+			prefix_reverse_delete_value(id, value, value_len);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			if (split_at == UINT_MAX) {
+				CHECK_CALL(mdb_stat(txn, dbi, &stat));
+				if (stat.ms_leaf_pages > 1)
+					split_at = id;
+			}
+			if (split_at != UINT_MAX && id >= split_at + extra) {
+				total = id + 1;
+				break;
+			}
+		}
+		if (!total) {
+			fprintf(stderr, "reverse delete: failed to create two leaves\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+		first_right = prefix_reverse_borrow_first_right(env, dbi);
+		if (!first_right || first_right + 2 >= total) {
+			fprintf(stderr, "reverse delete: invalid right leaf boundary\n");
+			exit(EXIT_FAILURE);
+		}
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		key = prefix_reverse_borrow_key(first_right + 1, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		key = prefix_reverse_borrow_key(first_right + 1, 1, keybuf);
+		prefix_reverse_delete_value(first_right + 1, value, value_len);
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, UINT_MAX,
+		    first_right + 1, value_len, counted, 1);
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		overflow_before = stat.ms_overflow_pages;
+		left_watch = prefix_reverse_delete_watch(txn, dbi,
+		    first_right - 1, 0);
+		pivot_watch = prefix_reverse_delete_watch(txn, dbi,
+		    first_right, 0);
+		right_watch = prefix_reverse_delete_watch(txn, dbi,
+		    first_right + 1, 1);
+		if (!(NODEPTR(pivot_watch->mc_pg[pivot_watch->mc_top],
+		    pivot_watch->mc_ki[pivot_watch->mc_top])->mn_flags & F_BIGDATA)) {
+			fprintf(stderr, "reverse delete: expected overflow value\n");
+			exit(EXIT_FAILURE);
+		}
+		key = prefix_reverse_borrow_key(first_right, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_overflow_pages + 1 != overflow_before) {
+			fprintf(stderr, "reverse delete: overflow allocation was not released\n");
+			exit(EXIT_FAILURE);
+		}
+		prefix_reverse_delete_check_watch(left_watch, first_right - 1,
+		    0, value_len, MDB_GET_CURRENT);
+		prefix_reverse_delete_check_watch(right_watch, first_right + 1,
+		    1, value_len, MDB_GET_CURRENT);
+		prefix_reverse_delete_check_watch(pivot_watch, first_right + 1,
+		    1, value_len, MDB_NEXT);
+		mdb_cursor_close(left_watch);
+		mdb_cursor_close(pivot_watch);
+		mdb_cursor_close(right_watch);
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, first_right,
+		    first_right + 1, value_len, counted, 1);
+		free(value);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+/* The same trunk change can overflow a root leaf, where split/retry must
+ * create a branch and retarget cursors on both resulting leaves.
+ */
+static void
+test_prefix_reverse_root_delete_overflow_regression(void)
+{
+	static const char *dir = "testdb_prefix_reverse_root_delete";
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env_with_mapsize(dir,
+		    128UL * 1024 * 1024);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_stat stat;
+		MDB_cursor *watch[5];
+		unsigned char keybuf[256];
+		unsigned char *value;
+		MDB_val key, data;
+		unsigned int total, ids[3];
+		unsigned int splits_before;
+		mdb_size_t overflow_before;
+		size_t value_len;
+
+		CHECK_CALL(mdb_env_stat(env, &stat));
+		total = (unsigned int)(stat.ms_psize / 32);
+		value_len = stat.ms_psize / 2 + 512;
+		value = malloc(value_len);
+		if (!value)
+			die_errno("malloc reverse root overflow value");
+		data.mv_size = value_len;
+		data.mv_data = value;
+		ids[0] = total / 5;
+		ids[1] = total / 2;
+		ids[2] = total * 4 / 5;
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION |
+		    MDB_REVERSEKEY | (counted ? MDB_COUNTED : 0), &dbi));
+		for (unsigned int id = 0; id < total; ++id) {
+			key = prefix_reverse_borrow_key(id, 0, keybuf);
+			prefix_reverse_delete_value(id, value, value_len);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_leaf_pages != 1 || stat.ms_depth != 1) {
+			fprintf(stderr, "reverse root delete: seed is not one leaf\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		key = prefix_reverse_borrow_key(1, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		key = prefix_reverse_borrow_key(1, 1, keybuf);
+		prefix_reverse_delete_value(1, value, value_len);
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_leaf_pages != 1 || stat.ms_depth != 1) {
+			fprintf(stderr, "reverse root delete: special key split leaf\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, UINT_MAX,
+		    1, value_len, counted, 1);
+
+		/* Exercise both nested outcomes before the committed delete. A
+		 * child abort must leave the parent unchanged; a child commit must
+		 * show the deletion in the parent, which is then aborted.
+		 */
+		for (unsigned int commit_child = 0; commit_child < 2;
+		    ++commit_child) {
+			MDB_txn *parent, *child;
+			MDB_val fetched;
+			int rc;
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &parent));
+			CHECK_CALL(mdb_txn_begin(env, parent, 0, &child));
+			splits_before = mdb_prefix_trunk_delete_splits;
+			key = prefix_reverse_borrow_key(0, 0, keybuf);
+			CHECK_CALL(mdb_del(child, dbi, &key, NULL));
+			if (mdb_prefix_trunk_delete_splits == splits_before) {
+				fprintf(stderr, "reverse root delete: child missed split/retry\n");
+				exit(EXIT_FAILURE);
+			}
+			if (commit_child)
+				CHECK_CALL(mdb_txn_commit(child));
+			else
+				mdb_txn_abort(child);
+			key = prefix_reverse_borrow_key(0, 0, keybuf);
+			rc = mdb_get(parent, dbi, &key, &fetched);
+			if (commit_child ? rc != MDB_NOTFOUND :
+			    (rc != MDB_SUCCESS || fetched.mv_size != value_len)) {
+				fprintf(stderr, "reverse root delete: child outcome leaked\n");
+				exit(EXIT_FAILURE);
+			}
+			if (counted) {
+				uint64_t count;
+				CHECK_CALL(mdb_count_all(parent, dbi, 0, &count));
+				if (count != total - commit_child) {
+					fprintf(stderr, "reverse root delete: child count wrong\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+			mdb_txn_abort(parent);
+			prefix_reverse_delete_verify(env, dbi, total, UINT_MAX,
+			    1, value_len, counted, 1);
+		}
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		overflow_before = stat.ms_overflow_pages;
+		watch[0] = prefix_reverse_delete_watch(txn, dbi, 0, 0);
+		watch[1] = prefix_reverse_delete_watch(txn, dbi, 1, 1);
+		for (unsigned int i = 0; i < 3; ++i)
+			watch[i + 2] = prefix_reverse_delete_watch(txn, dbi,
+			    ids[i], 0);
+		if (!(NODEPTR(watch[0]->mc_pg[watch[0]->mc_top],
+		    watch[0]->mc_ki[watch[0]->mc_top])->mn_flags & F_BIGDATA)) {
+			fprintf(stderr, "reverse root delete: expected overflow value\n");
+			exit(EXIT_FAILURE);
+		}
+		splits_before = mdb_prefix_trunk_delete_splits;
+		key = prefix_reverse_borrow_key(0, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_overflow_pages + 1 != overflow_before) {
+			fprintf(stderr, "reverse root delete: overflow allocation was not released\n");
+			exit(EXIT_FAILURE);
+		}
+		if (mdb_prefix_trunk_delete_splits == splits_before) {
+			fprintf(stderr, "reverse root delete: missed split/retry\n");
+			exit(EXIT_FAILURE);
+		}
+		prefix_reverse_delete_check_watch(watch[0], 1, 1,
+		    value_len, MDB_NEXT);
+		prefix_reverse_delete_check_watch(watch[1], 1, 1,
+		    value_len, MDB_GET_CURRENT);
+		for (unsigned int i = 0; i < 3; ++i)
+			prefix_reverse_delete_check_watch(watch[i + 2], ids[i],
+			    0, value_len, MDB_GET_CURRENT);
+		for (unsigned int i = 0; i < 5; ++i)
+			mdb_cursor_close(watch[i]);
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_leaf_pages < 2 || stat.ms_depth < 2) {
+			fprintf(stderr, "reverse root delete: root did not split\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, 0,
+		    1, value_len, counted, 1);
+		free(value);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+/* When the parent branch has space for one separator, replacing the second
+ * key of a child makes the branch full. Splitting that child on direct trunk
+ * deletion must then split the parent as well.
+ */
+static void
+test_prefix_reverse_parent_delete_split_regression(void)
+{
+	static const char *dir = "testdb_prefix_reverse_parent_delete";
+	for (unsigned int counted = 0; counted < 2; ++counted) {
+		MDB_env *env = create_env_with_mapsize(dir,
+		    256UL * 1024 * 1024);
+		MDB_txn *txn;
+		MDB_dbi dbi;
+		MDB_cursor *cur, *watch[4];
+		MDB_page *root;
+		MDB_stat stat;
+		MDB_val key, data;
+		unsigned char keybuf[256], value[128];
+		unsigned int total = 0, first_right;
+		unsigned int splits_before;
+		size_t room, need;
+
+		data.mv_size = sizeof(value);
+		data.mv_data = value;
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION |
+		    MDB_REVERSEKEY | (counted ? MDB_COUNTED : 0), &dbi));
+		CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+		for (unsigned int id = 0; id < UINT16_MAX; ++id) {
+			key = prefix_reverse_borrow_key(id, 0, keybuf);
+			prefix_reverse_delete_value(id, value, sizeof(value));
+			data.mv_size = sizeof(value);
+			data.mv_data = value;
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			total = id + 1;
+			if (id % 16)
+				continue;
+			CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_FIRST));
+			if (txn->mt_dbs[dbi].md_depth != 2)
+				continue;
+			root = cur->mc_pg[0];
+			room = SIZELEFT(root);
+			need = mdb_branch_size(env, root, &key);
+			if (room >= need && room < 2 * need &&
+			    NUMKEYS(root) > 10)
+				break;
+		}
+		CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_FIRST));
+		root = cur->mc_pg[0];
+		room = SIZELEFT(root);
+		need = mdb_branch_size(env, root, &key);
+		if (txn->mt_dbs[dbi].md_depth != 2 ||
+		    room < need || room >= 2 * need) {
+			fprintf(stderr, "reverse parent delete: branch not near full\n");
+			exit(EXIT_FAILURE);
+		}
+		mdb_cursor_close(cur);
+		CHECK_CALL(mdb_txn_commit(txn));
+		first_right = prefix_reverse_borrow_first_right(env, dbi);
+		if (!first_right || first_right + 2 >= total) {
+			fprintf(stderr, "reverse parent delete: invalid child boundary\n");
+			exit(EXIT_FAILURE);
+		}
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		key = prefix_reverse_borrow_key(first_right + 1, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		key = prefix_reverse_borrow_key(first_right + 1, 1, keybuf);
+		prefix_reverse_delete_value(first_right + 1,
+		    value, sizeof(value));
+		data.mv_size = sizeof(value);
+		data.mv_data = value;
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_depth != 2) {
+			fprintf(stderr, "reverse parent delete: setup split branch\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, UINT_MAX,
+		    first_right + 1, sizeof(value), counted, 0);
+
+		CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+		watch[0] = prefix_reverse_delete_watch(txn, dbi,
+		    first_right - 1, 0);
+		watch[1] = prefix_reverse_delete_watch(txn, dbi,
+		    first_right, 0);
+		watch[2] = prefix_reverse_delete_watch(txn, dbi,
+		    first_right + 1, 1);
+		watch[3] = prefix_reverse_delete_watch(txn, dbi,
+		    total / 2, 0);
+		splits_before = mdb_prefix_trunk_delete_splits;
+		key = prefix_reverse_borrow_key(first_right, 0, keybuf);
+		CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+		if (mdb_prefix_trunk_delete_splits == splits_before) {
+			fprintf(stderr, "reverse parent delete: missed split/retry\n");
+			exit(EXIT_FAILURE);
+		}
+		CHECK_CALL(mdb_stat(txn, dbi, &stat));
+		if (stat.ms_depth != 3) {
+			fprintf(stderr, "reverse parent delete: parent did not split\n");
+			exit(EXIT_FAILURE);
+		}
+		prefix_reverse_delete_check_watch(watch[0], first_right - 1,
+		    0, sizeof(value), MDB_GET_CURRENT);
+		prefix_reverse_delete_check_watch(watch[1], first_right + 1,
+		    1, sizeof(value), MDB_NEXT);
+		prefix_reverse_delete_check_watch(watch[2], first_right + 1,
+		    1, sizeof(value), MDB_GET_CURRENT);
+		prefix_reverse_delete_check_watch(watch[3], total / 2,
+		    0, sizeof(value), MDB_GET_CURRENT);
+		for (unsigned int i = 0; i < 4; ++i)
+			mdb_cursor_close(watch[i]);
+		CHECK_CALL(mdb_txn_commit(txn));
+		prefix_reverse_delete_verify(env, dbi, total, first_right,
+		    first_right + 1, sizeof(value), counted, 0);
+		mdb_env_close(env);
+		cleanup_env_dir(dir);
+	}
+}
+
+static void
+prefix_reverse_dup_value(unsigned int id, unsigned int which,
+	unsigned char value[8])
+{
+	memset(value, 0, 8);
+	value[0] = (unsigned char)(which + 1);
+	value[1] = (unsigned char)id;
+	value[2] = (unsigned char)(id >> 8);
+	value[7] = 0x5a;
+}
+
+static void
+prefix_reverse_dup_verify(MDB_env *env, MDB_dbi dbi,
+	unsigned int total, unsigned int deleted)
+{
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_stat stat;
+	MDB_val key, data;
+	unsigned char keybuf[256], value[8];
+	int rc;
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_entries != 2 * (total - (deleted != UINT_MAX))) {
+		fprintf(stderr, "reverse dup delete: incorrect entry count\n");
+		exit(EXIT_FAILURE);
+	}
+	{
+		uint64_t values, keys;
+		CHECK_CALL(mdb_count_all(txn, dbi, 0, &values));
+		CHECK_CALL(mdb_range_count_keys(txn, dbi,
+		    NULL, NULL, 0, &keys));
+		if (values != stat.ms_entries ||
+		    keys != total - (deleted != UINT_MAX)) {
+			fprintf(stderr, "reverse dup delete: incorrect counts\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	rc = mdb_cursor_get(cur, &key, &data, MDB_FIRST);
+	for (unsigned int id = 0; id < total; ++id) {
+		MDB_val expected;
+		if (id == deleted)
+			continue;
+		expected = prefix_reverse_borrow_key(id, id == 1, keybuf);
+		for (unsigned int which = 0; which < 2; ++which) {
+			prefix_reverse_dup_value(id, which, value);
+			if (rc != MDB_SUCCESS || key.mv_size != expected.mv_size ||
+			    memcmp(key.mv_data, expected.mv_data, expected.mv_size) ||
+			    data.mv_size != sizeof(value) ||
+			    memcmp(data.mv_data, value, sizeof(value))) {
+				fprintf(stderr, "reverse dup delete: changed row %u/%u\n",
+				    id, which);
+				exit(EXIT_FAILURE);
+			}
+			rc = mdb_cursor_get(cur, &key, &data, MDB_NEXT);
+		}
+	}
+	if (rc != MDB_NOTFOUND) {
+		fprintf(stderr, "reverse dup delete: unexpected remaining row\n");
+		exit(EXIT_FAILURE);
+	}
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+}
+
+static MDB_cursor *
+prefix_reverse_dup_watch(MDB_txn *txn, MDB_dbi dbi,
+	unsigned int id, unsigned int which)
+{
+	MDB_cursor *cur;
+	unsigned char keybuf[256], value[8];
+	MDB_val key = prefix_reverse_borrow_key(id, id == 1, keybuf);
+	MDB_val data = {sizeof(value), value};
+	prefix_reverse_dup_value(id, which, value);
+	CHECK_CALL(mdb_cursor_open(txn, dbi, &cur));
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, MDB_GET_BOTH));
+	return cur;
+}
+
+static void
+prefix_reverse_dup_check_watch(MDB_cursor *cur,
+	unsigned int id, unsigned int which, MDB_cursor_op op)
+{
+	unsigned char keybuf[256], value[8];
+	MDB_val expected = prefix_reverse_borrow_key(id, id == 1, keybuf);
+	MDB_val key = {0, NULL}, data = {0, NULL};
+	prefix_reverse_dup_value(id, which, value);
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, op));
+	if (key.mv_size != expected.mv_size ||
+	    memcmp(key.mv_data, expected.mv_data, expected.mv_size) ||
+	    data.mv_size != sizeof(value) ||
+	    memcmp(data.mv_data, value, sizeof(value))) {
+		fprintf(stderr, "reverse dup delete: live cursor changed at row %u/%u\n",
+		    id, which);
+		exit(EXIT_FAILURE);
+	}
+}
+
+/* Inline duplicate subpages must survive the trunk-delete split as well. */
+static void
+test_prefix_reverse_root_delete_dupsort_regression(void)
+{
+	static const char *dir = "testdb_prefix_reverse_root_dupsort";
+	MDB_env *env = create_env(dir);
+	MDB_txn *txn;
+	MDB_dbi dbi;
+	MDB_stat stat;
+	MDB_cursor *watch[5];
+	unsigned char keybuf[256], value[8];
+	MDB_val key, data = {sizeof(value), value};
+	unsigned int total, ids[3];
+	unsigned int splits_before;
+
+	CHECK_CALL(mdb_env_stat(env, &stat));
+	total = (unsigned int)(stat.ms_psize / 96);
+	ids[0] = total / 5;
+	ids[1] = total / 2;
+	ids[2] = total * 4 / 5;
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	CHECK_CALL(mdb_dbi_open(txn, NULL, MDB_PREFIX_COMPRESSION |
+	    MDB_REVERSEKEY | MDB_DUPSORT | MDB_COUNTED, &dbi));
+	for (unsigned int id = 0; id < total; ++id) {
+		key = prefix_reverse_borrow_key(id, 0, keybuf);
+		for (unsigned int which = 0; which < 2; ++which) {
+			prefix_reverse_dup_value(id, which, value);
+			CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+		}
+	}
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_leaf_pages != 1 || stat.ms_depth != 1) {
+		fprintf(stderr, "reverse dup delete: seed is not one leaf\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	key = prefix_reverse_borrow_key(1, 0, keybuf);
+	CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+	key = prefix_reverse_borrow_key(1, 1, keybuf);
+	for (unsigned int which = 0; which < 2; ++which) {
+		prefix_reverse_dup_value(1, which, value);
+		CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+	}
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_leaf_pages != 1 || stat.ms_depth != 1) {
+		fprintf(stderr, "reverse dup delete: special key split leaf\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	prefix_reverse_dup_verify(env, dbi, total, UINT_MAX);
+
+	CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+	watch[0] = prefix_reverse_dup_watch(txn, dbi, 0, 0);
+	watch[1] = prefix_reverse_dup_watch(txn, dbi, 1, 1);
+	for (unsigned int i = 0; i < 3; ++i)
+		watch[i + 2] = prefix_reverse_dup_watch(txn, dbi,
+		    ids[i], 1);
+	{
+		MDB_page *leaf = watch[1]->mc_pg[watch[1]->mc_top];
+		MDB_node *node = NODEPTR(leaf, watch[1]->mc_ki[watch[1]->mc_top]);
+		if (!(node->mn_flags & F_DUPDATA) || node->mn_flags & F_SUBDATA) {
+			fprintf(stderr, "reverse dup delete: expected inline duplicates\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	splits_before = mdb_prefix_trunk_delete_splits;
+	key = prefix_reverse_borrow_key(0, 0, keybuf);
+	CHECK_CALL(mdb_del(txn, dbi, &key, NULL));
+	if (mdb_prefix_trunk_delete_splits == splits_before) {
+		fprintf(stderr, "reverse dup delete: missed split/retry\n");
+		exit(EXIT_FAILURE);
+	}
+	prefix_reverse_dup_check_watch(watch[0], 1, 0, MDB_NEXT);
+	prefix_reverse_dup_check_watch(watch[1], 1, 1, MDB_GET_CURRENT);
+	for (unsigned int i = 0; i < 3; ++i)
+		prefix_reverse_dup_check_watch(watch[i + 2], ids[i],
+		    1, MDB_GET_CURRENT);
+	for (unsigned int i = 0; i < 5; ++i)
+		mdb_cursor_close(watch[i]);
+	CHECK_CALL(mdb_stat(txn, dbi, &stat));
+	if (stat.ms_leaf_pages < 2 || stat.ms_depth < 2) {
+		fprintf(stderr, "reverse dup delete: root did not split\n");
+		exit(EXIT_FAILURE);
+	}
+	CHECK_CALL(mdb_txn_commit(txn));
+	prefix_reverse_dup_verify(env, dbi, total, 0);
+	mdb_env_close(env);
+	cleanup_env_dir(dir);
+}
+#endif
 
 #define PSS_N_SHORT 27
 #define PSS_N_LONG  83
@@ -2485,6 +3748,258 @@ test_prefix_dupsort_corner_cases(void)
 	mdb_txn_abort(txn);
 	mdb_env_close(env);
 	cleanup_env_dir(dir);
+}
+
+static void
+prefix_inline_trunk_delete_value(unsigned int integer_dup, unsigned int id,
+	unsigned char *buf, size_t *len)
+{
+	if (integer_dup) {
+		mdb_size_t value = id < 2 ? id : (mdb_size_t)(id - 1) * 65536;
+		memcpy(buf, &value, sizeof(value));
+		*len = sizeof(value);
+	} else {
+		memset(buf, 'A', 256);
+		if (id == 1)
+			buf[0] = 'B';
+		buf[254] = (unsigned char)id;
+		buf[255] = (unsigned char)(id >> 8);
+		*len = 256;
+	}
+}
+
+static void
+prefix_inline_trunk_delete_check(MDB_cursor *cur, unsigned int integer_dup,
+	unsigned int id, MDB_cursor_op op)
+{
+	union {
+		mdb_size_t align;
+		unsigned char bytes[256];
+	} expected;
+	size_t len;
+	MDB_val key = {1, "k"}, data = {0, NULL};
+	prefix_inline_trunk_delete_value(integer_dup, id, expected.bytes, &len);
+	CHECK_CALL(mdb_cursor_get(cur, &key, &data, op));
+	if (key.mv_size != 1 || memcmp(key.mv_data, "k", 1) ||
+	    data.mv_size != len || memcmp(data.mv_data, expected.bytes, len)) {
+		fprintf(stderr, "inline trunk delete: changed duplicate %u\n", id);
+		exit(EXIT_FAILURE);
+	}
+}
+
+/* Removing the first inline duplicate can expand all encoded survivors when
+ * duplicate ordering does not follow their forward-byte prefixes. The inline
+ * subpage has no room to split, so the containing node must be promoted.
+ */
+static void
+test_prefix_dupsort_inline_trunk_delete_growth(void)
+{
+	static const char *dir = "testdb_prefix_inline_delete_growth";
+	const uint16_t one = 1;
+	for (unsigned int fixture = 0; fixture < 3; ++fixture) {
+		unsigned int integer_dup = fixture == 1;
+		unsigned int large = fixture == 2;
+		/* On big-endian hosts integer order follows forward-byte order. */
+		if (integer_dup && *(const unsigned char *)&one != 1)
+			continue;
+		for (unsigned int counted = 0; counted < 2; ++counted) {
+			MDB_env *env = create_env(dir);
+			MDB_txn *txn;
+			MDB_dbi dbi;
+			MDB_cursor *removed, *first, *last, *neighbor, *check;
+			MDB_stat stat;
+			MDB_val key = {1, "k"}, data;
+			MDB_val neighbor_key = {1, "z"};
+			union {
+				mdb_size_t align;
+				unsigned char bytes[256];
+			} value;
+			unsigned int total;
+			size_t len;
+#ifdef MDB_REBALANCE_COVERAGE
+			unsigned int splits_before;
+			unsigned int promotions_before;
+#endif
+
+			CHECK_CALL(mdb_env_stat(env, &stat));
+			total = large ? (unsigned int)(stat.ms_psize / 128) :
+			    (integer_dup ? 20 : 4);
+
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+			CHECK_CALL(mdb_dbi_open(txn, NULL,
+			    MDB_PREFIX_COMPRESSION | MDB_DUPSORT |
+			    (integer_dup ? MDB_INTEGERDUP : MDB_REVERSEDUP) |
+			    (counted ? MDB_COUNTED : 0), &dbi));
+			for (unsigned int id = 0; id < total; ++id) {
+				prefix_inline_trunk_delete_value(integer_dup, id,
+				    value.bytes, &len);
+				/* Seed reverse duplicates with the common A prefix. */
+				if (!integer_dup && id == 1)
+					value.bytes[0] = 'A';
+				data = (MDB_val){len, value.bytes};
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			}
+			if (!integer_dup) {
+				prefix_inline_trunk_delete_value(0, 1,
+				    value.bytes, &len);
+				value.bytes[0] = 'A';
+				data = (MDB_val){len, value.bytes};
+				CHECK_CALL(mdb_del(txn, dbi, &key, &data));
+				value.bytes[0] = 'B';
+				CHECK_CALL(mdb_put(txn, dbi, &key, &data, 0));
+			}
+			for (unsigned int id = 1; id <= 2; ++id) {
+				prefix_inline_trunk_delete_value(integer_dup, id,
+				    value.bytes, &len);
+				data = (MDB_val){len, value.bytes};
+				CHECK_CALL(mdb_put(txn, dbi, &neighbor_key, &data, 0));
+			}
+			CHECK_CALL(mdb_txn_commit(txn));
+
+			CHECK_CALL(mdb_txn_begin(env, NULL, 0, &txn));
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &removed));
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &first));
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &last));
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &neighbor));
+			prefix_inline_trunk_delete_value(integer_dup, 0,
+			    value.bytes, &len);
+			key = (MDB_val){1, "k"};
+			data = (MDB_val){len, value.bytes};
+			CHECK_CALL(mdb_cursor_get(removed, &key, &data, MDB_GET_BOTH));
+			prefix_inline_trunk_delete_value(integer_dup, 1,
+			    value.bytes, &len);
+			data = (MDB_val){len, value.bytes};
+			CHECK_CALL(mdb_cursor_get(first, &key, &data, MDB_GET_BOTH));
+			prefix_inline_trunk_delete_value(integer_dup, total - 1,
+			    value.bytes, &len);
+			key = (MDB_val){1, "k"};
+			data = (MDB_val){len, value.bytes};
+			CHECK_CALL(mdb_cursor_get(last, &key, &data, MDB_GET_BOTH));
+			prefix_inline_trunk_delete_value(integer_dup, 2,
+			    value.bytes, &len);
+			data = (MDB_val){len, value.bytes};
+			neighbor_key = (MDB_val){1, "z"};
+			CHECK_CALL(mdb_cursor_get(neighbor, &neighbor_key, &data,
+			    MDB_GET_BOTH));
+#ifdef MDB_REBALANCE_COVERAGE
+			{
+				MDB_page *leaf = first->mc_pg[first->mc_top];
+				MDB_node *node = NODEPTR(leaf,
+				    first->mc_ki[first->mc_top]);
+				if (!(node->mn_flags & F_DUPDATA) ||
+				    (node->mn_flags & F_SUBDATA)) {
+					fprintf(stderr, "inline trunk delete: seed was not inline\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+#endif
+			prefix_inline_trunk_delete_value(integer_dup, 0,
+			    value.bytes, &len);
+			key = (MDB_val){1, "k"};
+			data = (MDB_val){len, value.bytes};
+#ifdef MDB_REBALANCE_COVERAGE
+			splits_before = mdb_prefix_trunk_delete_splits;
+			promotions_before = mdb_prefix_inline_delete_promotions;
+#endif
+			CHECK_CALL(mdb_del(txn, dbi, &key, &data));
+#ifdef MDB_REBALANCE_COVERAGE
+			if (mdb_prefix_inline_delete_promotions == promotions_before) {
+				fprintf(stderr, "inline trunk delete: missed promotion\n");
+				exit(EXIT_FAILURE);
+			}
+			if (large && mdb_prefix_trunk_delete_splits ==
+			    splits_before) {
+				fprintf(stderr, "inline trunk delete: promoted sub-DB did not split\n");
+				exit(EXIT_FAILURE);
+			}
+#endif
+			prefix_inline_trunk_delete_check(removed, integer_dup,
+			    1, MDB_NEXT_DUP);
+			prefix_inline_trunk_delete_check(first, integer_dup,
+			    1, MDB_GET_CURRENT);
+			prefix_inline_trunk_delete_check(last, integer_dup,
+			    total - 1, MDB_GET_CURRENT);
+			{
+				MDB_val got_key = {0, NULL}, got_data = {0, NULL};
+				prefix_inline_trunk_delete_value(integer_dup, 2,
+				    value.bytes, &len);
+				CHECK_CALL(mdb_cursor_get(neighbor, &got_key, &got_data,
+				    MDB_GET_CURRENT));
+				if (got_key.mv_size != 1 ||
+				    memcmp(got_key.mv_data, "z", 1) ||
+				    got_data.mv_size != len ||
+				    memcmp(got_data.mv_data, value.bytes, len)) {
+					fprintf(stderr, "inline trunk delete: neighbor cursor changed\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+			mdb_cursor_close(removed);
+			mdb_cursor_close(first);
+			mdb_cursor_close(last);
+			mdb_cursor_close(neighbor);
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &check));
+			prefix_inline_trunk_delete_value(integer_dup, 1,
+			    value.bytes, &len);
+			key = (MDB_val){1, "k"};
+			data = (MDB_val){len, value.bytes};
+			CHECK_CALL(mdb_cursor_get(check, &key, &data, MDB_GET_BOTH));
+#ifdef MDB_REBALANCE_COVERAGE
+			{
+				MDB_page *leaf = check->mc_pg[check->mc_top];
+				MDB_node *node = NODEPTR(leaf,
+				    check->mc_ki[check->mc_top]);
+				if (!(node->mn_flags & F_DUPDATA) ||
+				    !(node->mn_flags & F_SUBDATA)) {
+					fprintf(stderr, "inline trunk delete: subpage did not promote\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+#endif
+			mdb_cursor_close(check);
+			CHECK_CALL(mdb_stat(txn, dbi, &stat));
+			if (stat.ms_entries != total + 1) {
+				fprintf(stderr, "inline trunk delete: wrong entry count\n");
+				exit(EXIT_FAILURE);
+			}
+			if (counted) {
+				uint64_t count;
+				CHECK_CALL(mdb_count_all(txn, dbi, 0, &count));
+				if (count != total + 1) {
+					fprintf(stderr, "inline trunk delete: wrong counted total\n");
+					exit(EXIT_FAILURE);
+				}
+			}
+			CHECK_CALL(mdb_txn_commit(txn));
+
+			CHECK_CALL(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn));
+			CHECK_CALL(mdb_stat(txn, dbi, &stat));
+			if (stat.ms_entries != total + 1) {
+				fprintf(stderr, "inline trunk delete: committed count wrong\n");
+					exit(EXIT_FAILURE);
+			}
+			CHECK_CALL(mdb_cursor_open(txn, dbi, &check));
+			for (unsigned int id = 1; id < total; ++id)
+				prefix_inline_trunk_delete_check(check, integer_dup,
+				    id, id == 1 ? MDB_FIRST : MDB_NEXT_DUP);
+			if (mdb_cursor_get(check, &key, &data, MDB_NEXT_DUP) !=
+			    MDB_NOTFOUND) {
+				fprintf(stderr, "inline trunk delete: extra duplicate\n");
+				exit(EXIT_FAILURE);
+			}
+			for (unsigned int id = 1; id <= 2; ++id) {
+				prefix_inline_trunk_delete_value(integer_dup, id,
+				    value.bytes, &len);
+				neighbor_key = (MDB_val){1, "z"};
+				data = (MDB_val){len, value.bytes};
+				CHECK_CALL(mdb_cursor_get(check, &neighbor_key, &data,
+				    MDB_GET_BOTH));
+			}
+			mdb_cursor_close(check);
+			mdb_txn_abort(txn);
+			mdb_env_close(env);
+			cleanup_env_dir(dir);
+		}
+	}
 }
 
 static void
@@ -4379,6 +5894,9 @@ main(void)
 	test_prefix_leaf_splits();
 	test_prefix_overflow_trunk_reencode_regression();
 	test_prefix_overflow_rebalance_regression();
+	test_prefix_overflow_ascending_rebalance();
+	test_prefix_merge_capacity_regression();
+	test_prefix_borrow_capacity_regression();
 	test_prefix_split_stride_reverse_regression();
 	test_prefix_split_trunk_reencode_regression();
 	test_prefix_alternating_prefixes();
@@ -4386,6 +5904,7 @@ main(void)
 	test_prefix_dupsort_smoke();
 	test_prefix_dupsort_corner_cases();
 	test_prefix_dupsort_inline_basic_ops();
+	test_prefix_dupsort_inline_trunk_delete_growth();
 	test_prefix_dupsort_inline_promote();
 	test_prefix_dupsort_inline_cmp_negative();
 	test_prefix_dupsort_trunk_key_shift_no_value_change();

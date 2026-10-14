@@ -215,13 +215,14 @@ badend:
 
 	/* Is buffer too short? */
 	while (c1[len-1] != '\n') {
-		buf->mv_data = realloc(buf->mv_data, buf->mv_size*2);
-		if (!buf->mv_data) {
+		void *newbuf = realloc(buf->mv_data, buf->mv_size*2);
+		if (!newbuf) {
 			Eof = 1;
 			fprintf(stderr, "%s: line %"Yu": out of memory, line too long\n",
 				prog, lineno);
 			return EOF;
 		}
+		buf->mv_data = newbuf;
 		c1 = buf->mv_data;
 		c1 += l2;
 		if (fgets((char *)c1, buf->mv_size+1, stdin) == NULL) {
@@ -294,8 +295,8 @@ static int greater(const MDB_val *a, const MDB_val *b)
 int main(int argc, char *argv[])
 {
 	int i, rc;
-	MDB_env *env;
-	MDB_txn *txn;
+	MDB_env *env = NULL;
+	MDB_txn *txn = NULL;
 	MDB_cursor *mc;
 	MDB_dbi dbi;
 	char *envname;
@@ -338,6 +339,7 @@ int main(int argc, char *argv[])
 			envflags |= MDB_NOSUBDIR;
 			break;
 		case 's':
+			free(subname);
 			subname = strdup(optarg);
 			break;
 		case 'N':
@@ -359,6 +361,10 @@ int main(int argc, char *argv[])
 
 	dbuf.mv_size = 4096;
 	dbuf.mv_data = malloc(dbuf.mv_size);
+	if (!dbuf.mv_data) {
+		rc = ENOMEM;
+		goto env_close;
+	}
 
 	if (!(mode & NOHDR))
 		readhdr();
@@ -367,7 +373,7 @@ int main(int argc, char *argv[])
 	rc = mdb_env_create(&env);
 	if (rc) {
 		fprintf(stderr, "mdb_env_create failed, error %d %s\n", rc, mdb_strerror(rc));
-		return EXIT_FAILURE;
+		goto env_close;
 	}
 
 	mdb_env_set_maxdbs(env, 2);
@@ -389,6 +395,10 @@ int main(int argc, char *argv[])
 
 	kbuf.mv_size = mdb_env_get_maxkeysize(env) * 2 + 2;
 	kbuf.mv_data = malloc(kbuf.mv_size * 2);
+	if (!kbuf.mv_data) {
+		rc = ENOMEM;
+		goto env_close;
+	}
 	k0buf.mv_size = kbuf.mv_size;
 	k0buf.mv_data = (char *)kbuf.mv_data + kbuf.mv_size;
 	prevk.mv_data = k0buf.mv_data;
@@ -506,6 +516,9 @@ txn_abort:
 	mdb_txn_abort(txn);
 env_close:
 	mdb_env_close(env);
+	free(kbuf.mv_data);
+	free(dbuf.mv_data);
+	free(subname);
 
 	return rc ? EXIT_FAILURE : EXIT_SUCCESS;
 }

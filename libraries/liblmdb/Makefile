@@ -44,7 +44,7 @@ ILIBS	= $(LIBS) $(SHLIBS)
 LINKLIBS	= $(LIBS)
 IPROGS	= dlmdb_stat dlmdb_copy dlmdb_dump dlmdb_load dlmdb_drop
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_rebalance mtest_prefix_generation mtest_reader mtest_cursor_reuse mtest_inmem mtest_leaf2 mtest_overflow count_bench compress_bench cursor_reuse_bench sample_bench dup_iter_bench leaf2_bench inmem_bench startup_bench seek_bench
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_rebalance mtest_prefix_generation mtest_reader mtest_cursor_reuse mtest_inmem mtest_leaf2 mtest_overflow mtest_memory count_bench compress_bench cursor_reuse_bench sample_bench dup_iter_bench leaf2_bench inmem_bench startup_bench seek_bench
 
 all:	$(ILIBS) $(PROGS)
 
@@ -79,6 +79,7 @@ test:	all
 	./mtest_count
 	./mtest_leaf2
 	./mtest_overflow
+	./mtest_memory
 
 libdlmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
@@ -116,6 +117,9 @@ mtest_cursor_reuse: mtest_cursor_reuse.c mdb.c dlmdb.h midl.h midl.o
 mtest_inmem:	mtest_inmem.o $(LINKLIBS)
 mtest_leaf2:	mtest_leaf2.o $(LINKLIBS)
 mtest_overflow:	mtest_overflow.o $(LINKLIBS)
+# Include both engine sources so every heap allocation is tracked.
+mtest_memory: mtest_memory.c mdb.c midl.c dlmdb.h midl.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) mtest_memory.c $(LDLIBS) -o $@
 count_bench:	count_bench.o $(LINKLIBS)
 compress_bench:	compress_bench.o $(LINKLIBS)
 # Include both root-fallback and ancestor-reuse paths for paired timings.

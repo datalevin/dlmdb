@@ -12,6 +12,7 @@
  * <http://www.OpenLDAP.org/license.html>.
  */
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -236,6 +237,11 @@ int main(int argc, char *argv[])
 			if (memchr(key.mv_data, '\0', key.mv_size))
 				continue;
 			str = malloc(key.mv_size+1);
+			if (!str) {
+				rc = ENOMEM;
+				mdb_cursor_close(cursor);
+				goto txn_abort;
+			}
 			memcpy(str, key.mv_data, key.mv_size);
 			str[key.mv_size] = '\0';
 			rc = mdb_open(txn, str, 0, &db2);
@@ -246,6 +252,7 @@ int main(int argc, char *argv[])
 			rc = mdb_stat(txn, db2, &mst);
 			if (rc) {
 				fprintf(stderr, "mdb_stat failed, error %d %s\n", rc, mdb_strerror(rc));
+				mdb_cursor_close(cursor);
 				goto txn_abort;
 			}
 			prstat(&mst);

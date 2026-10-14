@@ -279,6 +279,10 @@ int main(int argc, char *argv[])
 				continue;
 			count++;
 			str = malloc(key.mv_size+1);
+			if (!str) {
+				rc = ENOMEM;
+				break;
+			}
 			memcpy(str, key.mv_data, key.mv_size);
 			str[key.mv_size] = '\0';
 			rc = mdb_open(txn, str, 0, &db2);
@@ -288,8 +292,11 @@ int main(int argc, char *argv[])
 					list++;
 				} else {
 					rc = dumpit(txn, db2, str);
-					if (rc)
+					if (rc) {
+						free(str);
+						mdb_close(env, db2);
 						break;
+					}
 				}
 				mdb_close(env, db2);
 			}

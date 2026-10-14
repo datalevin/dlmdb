@@ -3311,6 +3311,15 @@ mdb_cursor_leaf_cache_clear(MDB_cursor_leaf_cache *cache)
 	mdb_cursor_leaf_cache_init(cache);
 }
 
+/* A cursor owns both its leaf cache and its embedded duplicate cursor's. */
+static void
+mdb_cursor_cache_clear(MDB_cursor *mc)
+{
+	mdb_cursor_leaf_cache_clear(&mc->mc_leaf_cache);
+	if (mc->mc_xcursor)
+		mdb_cursor_leaf_cache_clear(&mc->mc_xcursor->mx_cursor.mc_leaf_cache);
+}
+
 static int
 mdb_cursor_leaf_cache_ensure_vals(MDB_cursor_leaf_cache *cache, unsigned int count)
 {
@@ -5205,7 +5214,7 @@ mdb_prefix_count(MDB_txn *txn, MDB_dbi dbi, const MDB_val *key,
 	rc = MDB_SUCCESS;
 
 done:
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 #ifdef MDB_VL32
 	mdb_cursor_unref(&mc);
 #endif
@@ -5612,21 +5621,20 @@ mdb_cursor_chk(MDB_cursor *mc)
 static void mdb_audit(MDB_txn *txn)
 {
 	MDB_cursor mc = (MDB_cursor){0};
-	MDB_xcursor free_mx = (MDB_xcursor){0};
+	MDB_xcursor mx = (MDB_xcursor){0};
 	MDB_val key, data;
 	MDB_ID freecount, count;
 	MDB_dbi i;
 	int rc;
 
 	freecount = 0;
-	mdb_cursor_init(&mc, txn, FREE_DBI, &free_mx);
+	mdb_cursor_init(&mc, txn, FREE_DBI, &mx);
 	while ((rc = mdb_cursor_get(&mc, &key, &data, MDB_NEXT)) == 0)
 		freecount += *(MDB_ID *)data.mv_data;
 	mdb_tassert(txn, rc == MDB_NOTFOUND);
 
 	count = 0;
 	for (i = 0; i<txn->mt_numdbs; i++) {
-		MDB_xcursor mx = (MDB_xcursor){0};
 		if (!(txn->mt_dbflags[i] & DB_VALID))
 			continue;
 		mdb_cursor_init(&mc, txn, i, &mx);
@@ -5659,7 +5667,7 @@ static void mdb_audit(MDB_txn *txn)
 			txn->mt_txnid, freecount, count+NUM_METAS,
 			freecount+count+NUM_METAS, txn->mt_next_pgno);
 	}
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 }
 #endif
 
@@ -5970,7 +5978,7 @@ mdb_prefix_pair_leq(MDB_txn *txn, MDB_dbi dbi,
 	mdb_cursor_init(&mc, txn, dbi, &mx);
 	rc = mdb_prefix_pair_leq_cursor(&mc, key, key_inclusive,
 	    value, value_inclusive, out);
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	MDB_CURSOR_UNREF(&mc, 1);
 	return rc;
 }
@@ -6745,6 +6753,10 @@ mdb_cursor_shadow(MDB_txn *src, MDB_txn *dst)
 				if (!bk)
 					return ENOMEM;
 				*bk = *mc;
+				/* The backup owns the parent's buffers until commit/abort.
+				 * Child cursor operations must not realloc or overwrite them.
+				 */
+				mdb_cursor_leaf_cache_init(&mc->mc_leaf_cache);
 				mc->mc_backup = bk;
 				mc->mc_db = &dst->mt_dbs[i];
 				/* Kill pointers into src to reduce abuse: The
@@ -6755,6 +6767,7 @@ mdb_cursor_shadow(MDB_txn *src, MDB_txn *dst)
 				mc->mc_dbflag = &dst->mt_dbflags[i];
 				if ((mx = mc->mc_xcursor) != NULL) {
 					*(MDB_xcursor *)(bk+1) = *mx;
+					mdb_cursor_leaf_cache_init(&mx->mx_cursor.mc_leaf_cache);
 					mx->mx_cursor.mc_txn = dst;
 				}
 				mc->mc_next = dst->mt_cursors[i];
@@ -6790,13 +6803,20 @@ mdb_cursors_close(MDB_txn *txn, unsigned merge)
 					mc->mc_dbflag = bk->mc_dbflag;
 					if ((mx = mc->mc_xcursor) != NULL)
 						mx->mx_cursor.mc_txn = bk->mc_txn;
+					mdb_cursor_leaf_cache_clear(&bk->mc_leaf_cache);
+					if (bk->mc_xcursor)
+						mdb_cursor_leaf_cache_clear(
+							&((MDB_xcursor *)(bk+1))->mx_cursor.mc_leaf_cache);
 				} else {
 					/* Abort nested txn */
+					mdb_cursor_cache_clear(mc);
 					*mc = *bk;
 					if ((mx = mc->mc_xcursor) != NULL)
 						*mx = *(MDB_xcursor *)(bk+1);
 				}
 				mc = bk;
+			} else {
+				mdb_cursor_cache_clear(mc);
 			}
 			/* Only malloced cursors are permanently tracked. */
 			free(mc);
@@ -7125,8 +7145,13 @@ renew:
 	}
 	if (rc) {
 		if (txn != env->me_txn0) {
-			/* mt_rpages is owned by parent */
-			free(txn->mt_u.dirty_list);
+			/* Child dirty lists were released by mdb_txn_end().
+			 * Read txns own mt_rpages, but never a dirty list.
+			 */
+#ifdef MDB_VL32
+			if (!parent)
+				free(txn->mt_rpages);
+#endif
 			free(txn);
 		}
 	} else {
@@ -7987,6 +8012,7 @@ _mdb_txn_commit(MDB_txn *txn)
 
 		parent->mt_child = NULL;
 		mdb_midl_free(((MDB_ntxn *)txn)->mnt_pgstate.mf_pghead);
+		mdb_prefix_scratch_clear(&txn->mt_prefix);
 		free(txn);
 		return rc;
 	}
@@ -11143,7 +11169,7 @@ mdb_get(MDB_txn *txn, MDB_dbi dbi,
 	 * before doing anything else
 	 */
 	MDB_CURSOR_UNREF(&mc, 1);
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	return rc;
 }
 
@@ -15069,7 +15095,7 @@ mdb_cursor_close(MDB_cursor *mc)
 			if (*prev == mc)
 				*prev = mc->mc_next;
 		}
-		mdb_cursor_leaf_cache_clear(&mc->mc_leaf_cache);
+		mdb_cursor_cache_clear(mc);
 		free(mc);
 	}
 }
@@ -16533,7 +16559,7 @@ mdb_del0(MDB_txn *txn, MDB_dbi dbi,
 		rc = _mdb_cursor_del(&mc, flags);
 		txn->mt_cursors[dbi] = mc.mc_next;
 	}
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	return rc;
 }
 
@@ -17219,7 +17245,7 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 	txn->mt_cursors[dbi] = &mc;
 	rc = _mdb_cursor_put(&mc, key, data, flags);
 	txn->mt_cursors[dbi] = mc.mc_next;
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	return rc;
 }
 
@@ -18077,7 +18103,7 @@ mdb_count_all(MDB_txn *txn, MDB_dbi dbi, unsigned flags, uint64_t *out)
 		mdb_cursor_init(&mc, txn, dbi, mxp);
 		/* Refresh pointer after cursor init updates metadata. */
 		db = &txn->mt_dbs[dbi];
-		mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+		mdb_cursor_cache_clear(&mc);
 		MDB_CURSOR_UNREF(&mc, 1);
 	}
 
@@ -18208,7 +18234,7 @@ mdb_range_count_keys_dupsort(MDB_txn *txn, MDB_dbi dbi, MDB_cmp_func *key_cmp,
 	rc = MDB_SUCCESS;
 
 done:
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	MDB_CURSOR_UNREF(&mc, 1);
 	return rc;
 }
@@ -18307,7 +18333,7 @@ mdb_count_values_until(MDB_txn *txn, MDB_dbi dbi, MDB_cmp_func *key_cmp,
 	*out = txn->mt_dbs[dbi].md_entries;
 
 done:
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	MDB_CURSOR_UNREF(&mc, 1);
 	return rc;
 }
@@ -18405,7 +18431,7 @@ mdb_range_count_values(MDB_txn *txn, MDB_dbi dbi,
 
 cleanup:
 	if (have_cursor) {
-		mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+		mdb_cursor_cache_clear(&mc);
 		MDB_CURSOR_UNREF(&mc, 1);
 	}
 	return rc;
@@ -18463,6 +18489,7 @@ mdb_rank_for_key(MDB_txn *txn, MDB_dbi dbi,
 	rc = MDB_SUCCESS;
 
 done:
+	mdb_cursor_cache_clear(&mc);
 	MDB_CURSOR_UNREF(&mc, 1);
 	if (rc != MDB_SUCCESS)
 		return rc;
@@ -18735,8 +18762,22 @@ mdb_get_rank(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
 			rc = krc;
 		}
 	}
+	if (rc == MDB_SUCCESS && data &&
+	    F_ISSET(txn->mt_dbs[dbi].md_flags,
+		MDB_DUPSORT | MDB_PREFIX_COMPRESSION)) {
+		/* Duplicate keys can also point into the temporary cursor cache.
+		 * Keep their result separate from the outer key's scratch buffer.
+		 */
+		unsigned char *stable_data;
+		rc = mdb_prefix_ensure_encbuf(txn, data->mv_size, &stable_data);
+		if (rc == MDB_SUCCESS) {
+			if (data->mv_size)
+				memcpy(stable_data, data->mv_data, data->mv_size);
+			data->mv_data = stable_data;
+		}
+	}
 	MDB_CURSOR_UNREF(&mc, 1);
-	mdb_cursor_leaf_cache_clear(&mc.mc_leaf_cache);
+	mdb_cursor_cache_clear(&mc);
 	return rc;
 }
 

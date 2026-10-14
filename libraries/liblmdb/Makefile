@@ -118,7 +118,7 @@ mtest_inmem:	mtest_inmem.o $(LINKLIBS)
 mtest_leaf2:	mtest_leaf2.o $(LINKLIBS)
 mtest_overflow:	mtest_overflow.o $(LINKLIBS)
 # Include both engine sources so every heap allocation is tracked.
-mtest_memory: mtest_memory.c mdb.c midl.c dlmdb.h midl.h
+mtest_memory: mtest_memory.c mdb.c midl.c mdb_dump.c dlmdb.h midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) mtest_memory.c $(LDLIBS) -o $@
 count_bench:	count_bench.o $(LINKLIBS)
 compress_bench:	compress_bench.o $(LINKLIBS)

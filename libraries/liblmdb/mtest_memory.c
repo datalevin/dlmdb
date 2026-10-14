@@ -129,6 +129,11 @@ static int tracked_memalign(void **out, size_t alignment, size_t size,
 #undef free
 #undef posix_memalign
 
+/* Exercise the real dump routine with the allocation-tracked engine. */
+#define main mdb_dump_main
+#include "mdb_dump.c"
+#undef main
+
 enum { DUP_COUNT = 900, VALUE_SIZE = 490, SCAN_CYCLES = 1000 };
 static const char *test_name;
 
@@ -439,6 +444,42 @@ static void copy_drop_test(void) {
 	close_env(env, dir);
 }
 
+static void dump_test(unsigned count, int stop) {
+	char dir[] = "/tmp/dlmdb-memory-XXXXXX";
+	MDB_env *env = open_env(dir);
+	MDB_dbi dbi = populate(env, MDB_PREFIX_COMPRESSION, count);
+	MDB_txn *txn;
+	FILE *output = tmpfile();
+	int saved_stdout;
+	assert(output);
+	assert(fflush(stdout) == 0);
+	saved_stdout = dup(STDOUT_FILENO);
+	assert(saved_stdout >= 0);
+	assert(dup2(fileno(output), STDOUT_FILENO) >= 0);
+	assert(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) == 0);
+	/* Refresh DB metadata before injecting an iteration error. */
+	MDB_stat stat;
+	assert(mdb_stat(txn, dbi, &stat) == 0);
+	size_t blocks = live_blocks, bytes = live_bytes;
+	/* Cover exhaustion, empty DBs, signal interruption, and a cursor error.
+	 * Reader transaction abort cannot reclaim a cursor dumpit forgets.
+	 */
+	gotsig = stop == 1;
+	if (stop == 2)
+		mdb_env_set_interrupt(env, 1);
+	int rc = dumpit(txn, dbi, "dups");
+	gotsig = 0;
+	mdb_env_set_interrupt(env, 0);
+	assert(fflush(stdout) == 0);
+	assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+	assert(close(saved_stdout) == 0);
+	assert(fclose(output) == 0);
+	check_live(blocks, bytes);
+	assert(rc == (stop ? EINTR : MDB_SUCCESS));
+	mdb_txn_abort(txn);
+	close_env(env, dir);
+}
+
 int main(int argc, char **argv) {
 #define RUN(name, call) do { \
 	if (argc == 1 || !strcmp(argv[1], name)) { \
@@ -461,6 +502,10 @@ int main(int argc, char **argv) {
 	RUN("env-open-oom", env_failure_test(0));
 	RUN("reader-begin-failure", reader_failure_test());
 	RUN("copy-drop", copy_drop_test());
+	RUN("dump", dump_test(DUP_COUNT, 0));
+	RUN("dump-empty", dump_test(0, 0));
+	RUN("dump-signal", dump_test(DUP_COUNT, 1));
+	RUN("dump-error", dump_test(DUP_COUNT, 2));
 #ifndef MDB_VL32
 	RUN("inmemory-open-oom", env_failure_test(MDB_INMEMORY));
 #endif

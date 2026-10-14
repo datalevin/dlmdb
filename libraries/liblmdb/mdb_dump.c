@@ -131,7 +131,7 @@ static int dumpit(MDB_txn *txn, MDB_dbi dbi, char *name)
 	rc = mdb_cursor_open(txn, dbi, &mc);
 	if (rc) return rc;
 
-	while ((rc = mdb_cursor_get(mc, &key, &data, MDB_NEXT) == MDB_SUCCESS)) {
+	while ((rc = mdb_cursor_get(mc, &key, &data, MDB_NEXT)) == MDB_SUCCESS) {
 		if (gotsig) {
 			rc = EINTR;
 			break;
@@ -144,6 +144,7 @@ static int dumpit(MDB_txn *txn, MDB_dbi dbi, char *name)
 			byte(&data);
 		}
 	}
+	mdb_cursor_close(mc);
 	printf("DATA=END\n");
 	if (rc == MDB_NOTFOUND)
 		rc = MDB_SUCCESS;

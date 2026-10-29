@@ -444,6 +444,45 @@ static void copy_drop_test(void) {
 	close_env(env, dir);
 }
 
+/* Fail every allocation in the owned prepare/execute/close lifecycle. */
+static void prepared_copy_test(void) {
+	char dir[] = "/tmp/dlmdb-memory-XXXXXX";
+	char dest[] = "/tmp/dlmdb-prepared-memory-XXXXXX";
+	char file[256];
+	MDB_env *env = open_env(dir);
+	populate(env, MDB_PREFIX_COMPRESSION, DUP_COUNT);
+	assert(mkdtemp(dest));
+	snprintf(file, sizeof(file), "%s/data.mdb", dest);
+	size_t blocks = live_blocks, bytes = live_bytes;
+	for (unsigned mode = 0; mode <= MDB_CP_COMPACT; mode += MDB_CP_COMPACT) {
+		for (int execute = 0; execute <= 1; execute++) {
+			int fault;
+			for (fault = 0; fault < 32; fault++) {
+				MDB_copy *copy = (MDB_copy *)1;
+				failed_allocation = 0;
+				fail_after = fault;
+				int rc = mdb_env_copy_prepare(env, dest, mode, &copy);
+				if (!rc) {
+					assert(copy);
+					if (execute)
+						rc = mdb_env_copy_execute(copy);
+					assert(mdb_env_copy_close(copy) == 0);
+				} else
+					assert(!copy);
+				fail_after = -1;
+				assert(rc == 0 || rc == ENOMEM);
+				assert(unlink(file) == 0 || errno == ENOENT);
+				check_live(blocks, bytes);
+				if (!failed_allocation)
+					break;
+			}
+			assert(fault < 32);
+		}
+	}
+	assert(rmdir(dest) == 0);
+	close_env(env, dir);
+}
+
 static void dump_test(unsigned count, int stop) {
 	char dir[] = "/tmp/dlmdb-memory-XXXXXX";
 	MDB_env *env = open_env(dir);
@@ -502,6 +541,7 @@ int main(int argc, char **argv) {
 	RUN("env-open-oom", env_failure_test(0));
 	RUN("reader-begin-failure", reader_failure_test());
 	RUN("copy-drop", copy_drop_test());
+	RUN("prepared-copy-oom", prepared_copy_test());
 	RUN("dump", dump_test(DUP_COUNT, 0));
 	RUN("dump-empty", dump_test(0, 0));
 	RUN("dump-signal", dump_test(DUP_COUNT, 1));

@@ -259,6 +259,9 @@ typedef int mdb_filehandle_t;
  */
 typedef struct MDB_env MDB_env;
 
+/** @brief Opaque, single-use prepared copy snapshot. */
+typedef struct MDB_copy MDB_copy;
+
 /** @brief Opaque structure for a transaction handle.
  *
  * All database operations require a transaction handle. Transactions may be
@@ -745,6 +748,41 @@ int  mdb_env_copyfd(MDB_env *env, mdb_filehandle_t fd);
 	 * @return A non-zero error value on failure and 0 on success.
 	 */
 int  mdb_env_copy2(MDB_env *env, const char *path, unsigned int flags);
+
+	/** @brief Prepare the actual read snapshot used by an environment copy.
+	 * Opens an exclusive destination data file as in #mdb_env_copy2(), captures
+	 * a reader, matching meta pages and page bounds, and returns after releasing
+	 * the writer mutex. No database payload is written during preparation.
+	 * #mdb_env_copy_execute() never renews this snapshot. Both compact and
+	 * noncompact copies use the same preparation contract.
+	 *
+	 * The caller must keep env open and must not resize/remap it until closing
+	 * the handle. Prepare, execute and close must run on the same thread unless
+	 * env uses #MDB_NOTLS; even then the handle cannot be used concurrently.
+	 * Do not prepare while the calling thread owns a write transaction. A
+	 * #MDB_NOLOCK environment requires the caller to exclude writers during
+	 * preparation. Other writers may commit after preparation returns.
+	 *
+	 * On success, *copy owns the destination and reader, and must be passed to
+	 * #mdb_env_copy_close() even if never executed or execution fails. On failure,
+	 * *copy is NULL and all handles are released; an incomplete file may remain.
+	 * flags must be 0 or #MDB_CP_COMPACT. See #mdb_env_copy2() for path semantics.
+	 */
+int mdb_env_copy_prepare(MDB_env *env, const char *path, unsigned int flags, MDB_copy **copy);
+
+	/** @brief Write a prepared copy. May be called once, including on failure.
+	 * Uses the captured reader and bounds without acquiring the writer mutex.
+	 * The reader and destination stay owned until #mdb_env_copy_close().
+	 */
+int mdb_env_copy_execute(MDB_copy *copy);
+
+	/** @brief Release a prepared copy's reader, destination, and memory.
+	 * The handle is invalid afterwards. NULL is allowed. Returns a nonzero
+	 * error if closing the destination fails; all other resources are released.
+	 * Like #mdb_env_copy2(), does not sync the destination to durable storage.
+	 */
+int mdb_env_copy_close(MDB_copy *copy);
+
 
 	/** @brief Copy an LMDB environment to the specified file descriptor,
 	 *	with options.

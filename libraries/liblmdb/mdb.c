@@ -17536,14 +17536,168 @@ done:
 	return rc;
 }
 
+/* A prepared copy owns its reader and captured metadata, but no writer lock.
+ * The environment and mapping must outlive the handle. */
+struct MDB_copy {
+	MDB_env *mc_env;
+	MDB_txn *mc_txn;
+	HANDLE mc_fd;
+	unsigned int mc_flags;
+	int mc_own_fd;
+	int mc_executed;
+	char *mc_meta;
+	MDB_meta mc_empty_meta;
+	mdb_size_t mc_bytes;
+};
+
+int ESECT
+mdb_env_copy_close(MDB_copy *copy)
+{
+	int rc = MDB_SUCCESS;
+	if (!copy)
+		return rc;
+	_mdb_txn_abort(copy->mc_txn);
+	if (copy->mc_own_fd && close(copy->mc_fd) < 0)
+		rc = ErrCode();
+#ifdef _WIN32
+	_aligned_free(copy->mc_meta);
+#else
+	free(copy->mc_meta);
+#endif
+	free(copy);
+	return rc;
+}
+
+/* Prepare a snapshot for either copy algorithm. fd remains caller-owned on
+ * failure and until the path-based entry point transfers its ownership. */
+static int ESECT
+mdb_env_copy_prepare0(MDB_env *env, HANDLE fd, unsigned int flags, MDB_copy **out)
+{
+	MDB_copy *copy;
+	mdb_mutexref_t wmutex = NULL;
+	mdb_size_t meta_size, fsize;
+	int rc;
+
+	if (!out)
+		return EINVAL;
+	*out = NULL;
+	if (!env || !env->me_map || (flags & ~MDB_CP_COMPACT))
+		return EINVAL;
+	copy = calloc(1, sizeof(*copy));
+	if (!copy)
+		return ENOMEM;
+	copy->mc_env = env;
+	copy->mc_fd = fd;
+	copy->mc_flags = flags;
+	meta_size = env->me_psize * NUM_METAS;
+	/* Path-based copies may use unbuffered/direct I/O. Match the original
+	 * mapped metadata's alignment, also for the owned metadata buffer. */
+#ifdef _WIN32
+	copy->mc_meta = _aligned_malloc(meta_size, env->me_os_psize);
+	if (!copy->mc_meta) {
+		rc = ERROR_NOT_ENOUGH_MEMORY;
+		goto leave;
+	}
+#elif defined(HAVE_MEMALIGN)
+	copy->mc_meta = memalign(env->me_os_psize, meta_size);
+	if (!copy->mc_meta) {
+		rc = errno;
+		goto leave;
+	}
+#else
+	{
+		void *p;
+		rc = posix_memalign(&p, env->me_os_psize, meta_size);
+		if (rc)
+			goto leave;
+		copy->mc_meta = p;
+	}
+#endif
+
+	/* Reserve a reader slot before taking the writer mutex, matching the
+	 * original noncompact algorithm's reader/writer lock order. */
+	rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &copy->mc_txn);
+	if (rc)
+		goto leave;
+	if (env->me_txns) {
+		mdb_txn_end(copy->mc_txn, MDB_END_RESET_TMP);
+		wmutex = env->me_wmutex;
+		if (LOCK_MUTEX(rc, env, wmutex)) {
+			wmutex = NULL;
+			goto leave;
+		}
+		rc = mdb_txn_renew0(copy->mc_txn);
+		if (rc)
+			goto leave;
+	}
+
+	/* Freeze both meta pages and the matching bounds before writers resume.
+	 * Neither execution path may reset/renew this reader. */
+	memcpy(copy->mc_meta, env->me_map, meta_size);
+	mdb_env_init_meta0(env, &copy->mc_empty_meta);
+	copy->mc_empty_meta.mm_address =
+		((MDB_meta *)METADATA((MDB_page *)copy->mc_meta))->mm_address;
+	copy->mc_bytes = copy->mc_txn->mt_next_pgno * env->me_psize;
+	if (!(env->me_flags & MDB_INMEMORY)) {
+		rc = mdb_fsize(env->me_fd, &fsize);
+		if (rc)
+			goto leave;
+		if (copy->mc_bytes > fsize)
+			copy->mc_bytes = fsize;
+	}
+	if (copy->mc_bytes < meta_size) {
+		rc = EIO;
+		goto leave;
+	}
+	if (wmutex)
+		UNLOCK_MUTEX(wmutex);
+	*out = copy;
+	return MDB_SUCCESS;
+
+leave:
+	if (wmutex)
+		UNLOCK_MUTEX(wmutex);
+	mdb_env_copy_close(copy);
+	return rc;
+}
+
+int ESECT
+mdb_env_copy_prepare(MDB_env *env, const char *path, unsigned int flags, MDB_copy **out)
+{
+	MDB_name fname;
+	HANDLE fd = INVALID_HANDLE_VALUE;
+	int rc;
+
+	if (!out)
+		return EINVAL;
+	*out = NULL;
+	if (!env || !env->me_map || !path || (flags & ~MDB_CP_COMPACT))
+		return EINVAL;
+	rc = mdb_fname_init(path, env->me_flags | MDB_NOLOCK, &fname);
+	if (rc)
+		return rc;
+	rc = mdb_fopen(env, &fname, MDB_O_COPY, 0666, &fd);
+	mdb_fname_destroy(fname);
+	if (rc)
+		return rc;
+	rc = mdb_env_copy_prepare0(env, fd, flags, out);
+	if (rc)
+		close(fd);
+	else
+		(*out)->mc_own_fd = 1;
+	return rc;
+}
+
 	/** Copy environment with compaction. */
 static int ESECT
-mdb_env_copyfd1(MDB_env *env, HANDLE fd)
+mdb_env_copyfd1(MDB_copy *copy)
 {
+	MDB_env *env = copy->mc_env;
+	HANDLE fd = copy->mc_fd;
 	MDB_meta *mm;
 	MDB_page *mp;
 	mdb_copy my = {0};
-	MDB_txn *txn = NULL;
+	MDB_txn *txn = copy->mc_txn;
 	pthread_t thr;
 	pgno_t root, new_root;
 	int rc = MDB_SUCCESS;
@@ -17589,17 +17743,12 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 	if (rc)
 		goto done;
 
-	rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
-	if (rc)
-		goto finish;
-
 	mp = (MDB_page *)my.mc_wbuf[0];
 	memset(mp, 0, NUM_METAS * env->me_psize);
 	mp->mp_pgno = 0;
 	mp->mp_flags = P_META;
 	mm = (MDB_meta *)METADATA(mp);
-	mdb_env_init_meta0(env, mm);
-	mm->mm_address = env->me_metas[0]->mm_address;
+	*mm = copy->mc_empty_meta;
 
 	mp = (MDB_page *)(my.mc_wbuf[0] + env->me_psize);
 	mp->mp_pgno = 1;
@@ -17652,7 +17801,6 @@ finish:
 		my.mc_error = rc;
 	mdb_env_cthr_toggle(&my, 1 | MDB_EOF);
 	rc = THREAD_FINISH(thr);
-	_mdb_txn_abort(txn);
 
 done:
 #ifdef _WIN32
@@ -17670,12 +17818,12 @@ done2:
 
 	/** Copy environment as-is. */
 static int ESECT
-mdb_env_copyfd0(MDB_env *env, HANDLE fd)
+mdb_env_copyfd0(MDB_copy *copy)
 {
-	MDB_txn *txn = NULL;
-	mdb_mutexref_t wmutex = NULL;
+	MDB_env *env = copy->mc_env;
+	HANDLE fd = copy->mc_fd;
 	int rc;
-	mdb_size_t wsize, w3;
+	mdb_size_t wsize;
 	char *ptr;
 #ifdef _WIN32
 	DWORD len, w2;
@@ -17686,31 +17834,8 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 #define DO_WRITE(rc, fd, ptr, w2, len)	len = write(fd, ptr, w2); rc = (len >= 0)
 #endif
 
-	/* Do the lock/unlock of the reader mutex before starting the
-	 * write txn.  Otherwise other read txns could block writers.
-	 */
-	rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
-	if (rc)
-		return rc;
-
-	if (env->me_txns) {
-		/* We must start the actual read txn after blocking writers */
-		mdb_txn_end(txn, MDB_END_RESET_TMP);
-
-		/* Temporarily block writers until we snapshot the meta pages */
-		wmutex = env->me_wmutex;
-		if (LOCK_MUTEX(rc, env, wmutex))
-			goto leave;
-
-		rc = mdb_txn_renew0(txn);
-		if (rc) {
-			UNLOCK_MUTEX(wmutex);
-			goto leave;
-		}
-	}
-
 	wsize = env->me_psize * NUM_METAS;
-	ptr = env->me_map;
+	ptr = copy->mc_meta;
 	w2 = wsize;
 	while (w2 > 0) {
 		DO_WRITE(rc, fd, ptr, w2, len);
@@ -17728,21 +17853,11 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 			break;
 		}
 	}
-	if (wmutex)
-		UNLOCK_MUTEX(wmutex);
-
 	if (rc)
-		goto leave;
+		return rc;
 
-	w3 = txn->mt_next_pgno * env->me_psize;
-	if (!(env->me_flags & MDB_INMEMORY)) {
-		mdb_size_t fsize = 0;
-		if ((rc = mdb_fsize(env->me_fd, &fsize)))
-			goto leave;
-		if (w3 > fsize)
-			w3 = fsize;
-	}
-	wsize = w3 - wsize;
+	ptr = env->me_map + wsize;
+	wsize = copy->mc_bytes - wsize;
 	while (wsize > 0) {
 		if (wsize > MAX_WRITE)
 			w2 = MAX_WRITE;
@@ -17763,18 +17878,31 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 		}
 	}
 
-leave:
-	_mdb_txn_abort(txn);
 	return rc;
+}
+
+int ESECT
+mdb_env_copy_execute(MDB_copy *copy)
+{
+	if (!copy || copy->mc_executed)
+		return EINVAL;
+	copy->mc_executed = 1;
+	if (copy->mc_flags & MDB_CP_COMPACT)
+		return mdb_env_copyfd1(copy);
+	return mdb_env_copyfd0(copy);
 }
 
 int ESECT
 mdb_env_copyfd2(MDB_env *env, HANDLE fd, unsigned int flags)
 {
-	if (flags & MDB_CP_COMPACT)
-		return mdb_env_copyfd1(env, fd);
-	else
-		return mdb_env_copyfd0(env, fd);
+	MDB_copy *copy;
+	int rc, close_rc;
+	rc = mdb_env_copy_prepare0(env, fd, flags, &copy);
+	if (rc)
+		return rc;
+	rc = mdb_env_copy_execute(copy);
+	close_rc = mdb_env_copy_close(copy);
+	return rc ? rc : close_rc;
 }
 
 int ESECT
@@ -17786,21 +17914,14 @@ mdb_env_copyfd(MDB_env *env, HANDLE fd)
 int ESECT
 mdb_env_copy2(MDB_env *env, const char *path, unsigned int flags)
 {
-	int rc;
-	MDB_name fname;
-	HANDLE newfd = INVALID_HANDLE_VALUE;
-
-	rc = mdb_fname_init(path, env->me_flags | MDB_NOLOCK, &fname);
-	if (rc == MDB_SUCCESS) {
-		rc = mdb_fopen(env, &fname, MDB_O_COPY, 0666, &newfd);
-		mdb_fname_destroy(fname);
-	}
-	if (rc == MDB_SUCCESS) {
-		rc = mdb_env_copyfd2(env, newfd, flags);
-		if (close(newfd) < 0 && rc == MDB_SUCCESS)
-			rc = ErrCode();
-	}
-	return rc;
+	MDB_copy *copy;
+	int rc, close_rc;
+	rc = mdb_env_copy_prepare(env, path, flags, &copy);
+	if (rc)
+		return rc;
+	rc = mdb_env_copy_execute(copy);
+	close_rc = mdb_env_copy_close(copy);
+	return rc ? rc : close_rc;
 }
 
 int ESECT

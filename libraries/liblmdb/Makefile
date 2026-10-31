@@ -44,7 +44,7 @@ ILIBS	= $(LIBS) $(SHLIBS)
 LINKLIBS	= $(LIBS)
 IPROGS	= dlmdb_stat dlmdb_copy dlmdb_dump dlmdb_load dlmdb_drop
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1 mdb_drop.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_rebalance mtest_prefix_generation mtest_reader mtest_cursor_reuse mtest_copy mtest_inmem mtest_leaf2 mtest_overflow mtest_memory count_bench compress_bench cursor_reuse_bench sample_bench dup_iter_bench leaf2_bench inmem_bench startup_bench seek_bench
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 mtest_count mtest_prefix mtest_prefix_rebalance mtest_prefix_generation mtest_reader mtest_cursor_reuse mtest_copy mtest_inmem mtest_leaf2 mtest_overflow mtest_memory mtest_dup_projection count_bench compress_bench cursor_reuse_bench sample_bench dup_iter_bench dup_projection_bench leaf2_bench inmem_bench startup_bench seek_bench
 
 all:	$(ILIBS) $(PROGS)
 
@@ -81,6 +81,7 @@ test:	all
 	./mtest_leaf2
 	./mtest_overflow
 	./mtest_memory
+	./mtest_dup_projection
 
 libdlmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
@@ -174,3 +175,10 @@ xmdb.o: mdb.c dlmdb.h midl.h
 
 xmidl.o: midl.c midl.h
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -O0 $(COV_FLAGS) -c midl.c -o $@
+
+# Verify selective prefix reconstruction and ordinary-cursor equivalence.
+mtest_dup_projection: mtest_dup_projection.c mdb.c dlmdb.h midl.h midl.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) mtest_dup_projection.c midl.o $(LDLIBS) -o $@
+
+# Compare whole-duplicate materialization with selective prefix reconstruction.
+dup_projection_bench: dup_projection_bench.o $(LINKLIBS)

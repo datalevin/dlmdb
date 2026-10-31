@@ -13,6 +13,7 @@ features:
   - Efficient range count.
 * Prefix compression.
 * DUPSORT iteration optimization.
+* [Selective duplicate projection](duplicate-projection.md).
 * More robust interrupt handling.
 * True in-memory mode (`MDB_INMEMORY`).
 * Various performance optimizations.

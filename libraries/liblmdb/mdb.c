@@ -1419,29 +1419,26 @@ typedef struct MDB_prefix_header {
 	unsigned int valid; /**< header decode succeeded */
 } MDB_prefix_header;
 
-static int
-mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
-	size_t encoded_len, MDB_val *out, void *buf, size_t buf_size,
-	int allow_trunk_alias, const MDB_prefix_header *header)
+/* Logical bytes of a leaf key, without expanding its shared prefix. */
+typedef struct MDB_key_parts {
+	const unsigned char *prefix;
+	size_t prefix_len;
+	const unsigned char *suffix;
+	size_t suffix_len;
+} MDB_key_parts;
+
+/* Keep partial inspection and full decoding on the same format decision.
+ * In particular, plausible prefix headers can actually be legacy raw keys. */
+static inline int
+mdb_leaf_key_parts(const MDB_val *trunk, const unsigned char *encoded,
+	size_t encoded_len, size_t limit, const MDB_prefix_header *header,
+	MDB_key_parts *parts)
 {
-	size_t used = 0;
+	size_t used = 0, suffix_len;
 	uint64_t shared = 0;
-	size_t suffix_len, full_len;
-	unsigned char *decoded;
 
-	if (!trunk || !trunk->mv_data) {
-		if (!allow_trunk_alias) {
-			if (encoded_len > buf_size)
-				return MDB_BAD_VALSIZE;
-			memcpy(buf, encoded, encoded_len);
-			out->mv_data = buf;
-		} else {
-			out->mv_data = (void *)encoded;
-		}
-		out->mv_size = encoded_len;
-		return MDB_SUCCESS;
-	}
-
+	if (!trunk || !trunk->mv_data)
+		goto raw;
 	if (header && header->valid) {
 		shared = header->shared;
 		used = header->used;
@@ -1450,80 +1447,57 @@ mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
 		if (rc != MDB_SUCCESS)
 			return rc;
 	}
-
 	if (shared > trunk->mv_size || used > encoded_len)
-		goto raw_fallback;
-
+		goto raw;
 	suffix_len = encoded_len - used;
-	full_len = (size_t)shared + suffix_len;
-	if (full_len > buf_size)
+	/* Match the full decoder's capacity check before raw-format fallback. */
+	if (shared > limit || suffix_len > limit - (size_t)shared)
 		return MDB_BAD_VALSIZE;
-
-	decoded = (unsigned char *)buf;
-	memcpy(decoded, trunk->mv_data, (size_t)shared);
-	memcpy(decoded + (size_t)shared, encoded + used, suffix_len);
-
-	/* Reject accidental parses of raw keys as prefix-encoded payloads.
-	 * A valid encoding must round-trip with the canonical shared prefix.
-	 */
-	{
-		const unsigned char *trunk_bytes =
-		    (const unsigned char *)trunk->mv_data;
-		size_t canonical_shared = (size_t)shared;
-		size_t trunk_tail = trunk->mv_size - canonical_shared;
-		size_t extra = 0;
-
-		/* decoded starts with exactly 'shared' trunk bytes; only scan tail */
-		while (extra < suffix_len && extra < trunk_tail &&
-		    trunk_bytes[canonical_shared + extra] == encoded[used + extra])
-			extra++;
-
-		/* Any extra shared bytes mean the payload wasn't canonically encoded. */
-		if (extra)
-			goto raw_fallback;
-
-		/* Fast path: one-byte shared prefix header is always canonical. */
-		if (!(used == 1 && encoded[0] < 0x80)) {
-			size_t canonical_used = mdb_varint_length(canonical_shared);
-			unsigned char hdr[MDB_VARINT_MAX];
-			size_t hdr_len;
-
-			if (canonical_used != used)
-				goto raw_fallback;
-
-			hdr_len = mdb_varint_encode(canonical_shared, hdr);
-			if (hdr_len != canonical_used ||
-			    memcmp(encoded, hdr, hdr_len) != 0)
-				goto raw_fallback;
-		}
+	if (suffix_len && shared < trunk->mv_size &&
+	    ((const unsigned char *)trunk->mv_data)[shared] == encoded[used])
+		goto raw;
+	if (!(used == 1 && encoded[0] < 0x80)) {
+		unsigned char canonical[MDB_VARINT_MAX];
+		size_t n = mdb_varint_encode(shared, canonical);
+		if (n != used || memcmp(encoded, canonical, n))
+			goto raw;
 	}
-
-	out->mv_data = decoded;
-	out->mv_size = full_len;
+	parts->prefix = trunk->mv_data;
+	parts->prefix_len = (size_t)shared;
+	parts->suffix = encoded + used;
+	parts->suffix_len = suffix_len;
 	return MDB_SUCCESS;
+raw:
+	parts->prefix = NULL;
+	parts->prefix_len = 0;
+	parts->suffix = encoded;
+	parts->suffix_len = encoded_len;
+	return MDB_SUCCESS;
+}
 
-raw_fallback:
-	if (!trunk || !trunk->mv_data) {
-		if (!allow_trunk_alias) {
-			if (encoded_len > buf_size)
-				return MDB_BAD_VALSIZE;
-			memcpy(buf, encoded, encoded_len);
-			out->mv_data = buf;
-		} else {
-			out->mv_data = (void *)encoded;
-		}
-		out->mv_size = encoded_len;
+static int
+mdb_leaf_decode_key(const MDB_val *trunk, const unsigned char *encoded,
+	size_t encoded_len, MDB_val *out, void *buf, size_t buf_size,
+	int allow_trunk_alias, const MDB_prefix_header *header)
+{
+	MDB_key_parts parts;
+	int rc = mdb_leaf_key_parts(trunk, encoded, encoded_len, buf_size,
+	    header, &parts);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	out->mv_size = parts.prefix_len + parts.suffix_len;
+	if (!parts.prefix && allow_trunk_alias) {
+		out->mv_data = (void *)parts.suffix;
 		return MDB_SUCCESS;
 	}
-	if (!allow_trunk_alias) {
-		if (encoded_len > buf_size)
-			return MDB_BAD_VALSIZE;
-		memcpy(buf, encoded, encoded_len);
-		out->mv_data = buf;
-	} else {
-		out->mv_data = (void *)encoded;
-	}
-	out->mv_size = encoded_len;
+	if (out->mv_size > buf_size)
+		return MDB_BAD_VALSIZE;
+	if (parts.prefix_len)
+		memcpy(buf, parts.prefix, parts.prefix_len);
+	if (parts.suffix_len)
+		memcpy((unsigned char *)buf + parts.prefix_len,
+		    parts.suffix, parts.suffix_len);
+	out->mv_data = buf;
 	return MDB_SUCCESS;
 }
 
@@ -15075,6 +15049,405 @@ mdb_cursor_list_dup(MDB_cursor *mc, const MDB_val **values, mdb_size_t *countp)
 	*countp = cache->decoded_count;
 	*values = cache->decoded_count ? cache->decoded_vals : NULL;
 	return MDB_SUCCESS;
+}
+
+
+/* Reusable selection and storage belong to one active scan, not to a page's
+ * whole-leaf decoded cache. Raw values alias mapped pages on ordinary builds. */
+struct MDB_dup_projector {
+	MDB_val *prefixes;
+	uint32_t *prefix32; /* Common fixed-width prefixes, in bytewise order. */
+	size_t count;
+	unsigned char *prefix_bytes;
+	unsigned char *arena;
+	size_t arena_cap;
+	size_t arena_used;
+	size_t *offsets;
+};
+
+void
+mdb_dup_projector_destroy(MDB_dup_projector *projector)
+{
+	if (!projector)
+		return;
+	free(projector->prefixes);
+	free(projector->prefix32);
+	free(projector->prefix_bytes);
+	free(projector->arena);
+	free(projector->offsets);
+	free(projector);
+}
+
+int
+mdb_dup_projector_create(MDB_dup_projector **out,
+	const MDB_val *prefixes, size_t count)
+{
+	size_t bytes = 0;
+	MDB_dup_projector *p;
+	if (!out || !prefixes || !count || count > SIZE_MAX / sizeof(MDB_val) ||
+	    count > SIZE_MAX / sizeof(size_t))
+		return EINVAL;
+	*out = NULL;
+	for (size_t i = 0; i < count; i++) {
+		if (!prefixes[i].mv_data || !prefixes[i].mv_size ||
+		    prefixes[i].mv_size > SIZE_MAX - bytes)
+			return EINVAL;
+		if (i) {
+			size_t n = prefixes[i-1].mv_size < prefixes[i].mv_size ?
+			    prefixes[i-1].mv_size : prefixes[i].mv_size;
+			/* Equal leading bytes mean an overlap, including equal prefixes. */
+			if (memcmp(prefixes[i-1].mv_data, prefixes[i].mv_data, n) >= 0)
+				return EINVAL;
+		}
+		bytes += prefixes[i].mv_size;
+	}
+	p = calloc(1, sizeof(*p));
+	if (!p)
+		return ENOMEM;
+	p->prefixes = malloc(count * sizeof(MDB_val));
+	p->prefix_bytes = malloc(bytes);
+	p->offsets = malloc(count * sizeof(size_t));
+	if (!p->prefixes || !p->prefix_bytes || !p->offsets) {
+		mdb_dup_projector_destroy(p);
+		return ENOMEM;
+	}
+	p->count = count;
+	int fixed32 = 1;
+	for (size_t i = 0; i < count; i++)
+		if (prefixes[i].mv_size != 4) fixed32 = 0;
+	if (fixed32) {
+		p->prefix32 = malloc(count * sizeof(uint32_t));
+		if (!p->prefix32) {
+			mdb_dup_projector_destroy(p);
+			return ENOMEM;
+		}
+		for (size_t i = 0; i < count; i++) {
+			const unsigned char *b = prefixes[i].mv_data;
+			p->prefix32[i] = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+			    ((uint32_t)b[2] << 8) | b[3];
+		}
+	}
+	bytes = 0;
+	for (size_t i = 0; i < count; i++) {
+		p->prefixes[i].mv_size = prefixes[i].mv_size;
+		p->prefixes[i].mv_data = p->prefix_bytes + bytes;
+		memcpy(p->prefixes[i].mv_data, prefixes[i].mv_data, prefixes[i].mv_size);
+		bytes += prefixes[i].mv_size;
+	}
+	*out = p;
+	return MDB_SUCCESS;
+}
+
+/* Compare only enough logical bytes to decide whether a value starts with
+ * a requested prefix; equality includes values longer than that prefix. */
+static int
+mdb_dup_prefix_compare(const MDB_key_parts *parts, const MDB_val *prefix)
+{
+	const unsigned char *key = prefix->mv_data;
+	size_t n = parts->prefix_len < prefix->mv_size ?
+	    parts->prefix_len : prefix->mv_size;
+	int cmp = n ? memcmp(parts->prefix, key, n) : 0;
+	if (cmp || n == prefix->mv_size)
+		return cmp;
+	size_t left = prefix->mv_size - n;
+	size_t m = parts->suffix_len < left ? parts->suffix_len : left;
+	cmp = m ? memcmp(parts->suffix, key + n, m) : 0;
+	return cmp ? cmp : (m < left ? -1 : 0);
+}
+
+static int
+mdb_dup_project_store(MDB_dup_projector *p, const MDB_key_parts *parts,
+	size_t slot, MDB_val *values, unsigned char *present)
+{
+	size_t n = parts->prefix_len + parts->suffix_len;
+#ifndef MDB_VL32
+	if (!parts->prefix) {
+		values[slot].mv_data = (void *)parts->suffix;
+		values[slot].mv_size = n;
+		present[slot] = 1;
+		return MDB_SUCCESS;
+	}
+#endif
+	if (n > SIZE_MAX - p->arena_used)
+		return ENOMEM;
+	size_t need = p->arena_used + n;
+	if (need > p->arena_cap) {
+		size_t cap = p->arena_cap ? p->arena_cap : 256;
+		while (cap < need) {
+			if (cap > SIZE_MAX / 2) {
+				cap = need;
+				break;
+			}
+			cap *= 2;
+		}
+		unsigned char *arena = realloc(p->arena, cap);
+		if (!arena)
+			return ENOMEM;
+		p->arena = arena;
+		p->arena_cap = cap;
+	}
+	if (parts->prefix_len)
+		memcpy(p->arena + p->arena_used, parts->prefix, parts->prefix_len);
+	if (parts->suffix_len)
+		memcpy(p->arena + p->arena_used + parts->prefix_len,
+		    parts->suffix, parts->suffix_len);
+	p->offsets[slot] = p->arena_used;
+	p->arena_used = need;
+	values[slot].mv_size = n;
+	present[slot] = 1;
+	return MDB_SUCCESS;
+}
+
+/* Read four logical bytes without assembling a temporary key or calling
+ * memcmp for each span. The generic path remains available for other widths. */
+static uint32_t
+mdb_dup_prefix32(const MDB_key_parts *parts)
+{
+	const unsigned char *a = parts->prefix, *b = parts->suffix;
+	switch (parts->prefix_len) {
+	case 0: return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+		    ((uint32_t)b[2] << 8) | b[3];
+	case 1: return ((uint32_t)a[0] << 24) | ((uint32_t)b[0] << 16) |
+		    ((uint32_t)b[1] << 8) | b[2];
+	case 2: return ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+		    ((uint32_t)b[0] << 8) | b[1];
+	case 3: return ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+		    ((uint32_t)a[2] << 8) | b[0];
+	default: return ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+		    ((uint32_t)a[2] << 8) | a[3];
+	}
+}
+
+static int
+mdb_dup_project_match(MDB_dup_projector *p, const MDB_key_parts *parts,
+	size_t *wanted, MDB_val *values, unsigned char *present)
+{
+	if (p->prefix32) {
+		if (parts->prefix_len + parts->suffix_len < 4)
+			return MDB_SUCCESS;
+		uint32_t value = mdb_dup_prefix32(parts);
+		while (*wanted < p->count && value > p->prefix32[*wanted])
+			(*wanted)++;
+		if (*wanted < p->count && value == p->prefix32[*wanted]) {
+			int rc = mdb_dup_project_store(p, parts, *wanted, values, present);
+			if (rc != MDB_SUCCESS) return rc;
+			(*wanted)++;
+		}
+		return MDB_SUCCESS;
+	}
+	while (*wanted < p->count) {
+		int cmp = mdb_dup_prefix_compare(parts, &p->prefixes[*wanted]);
+		if (cmp < 0)
+			return MDB_SUCCESS;
+		if (cmp == 0) {
+			int rc = mdb_dup_project_store(p, parts, *wanted, values, present);
+			if (rc != MDB_SUCCESS)
+				return rc;
+			(*wanted)++;
+			return MDB_SUCCESS;
+		}
+		(*wanted)++;
+	}
+	return MDB_SUCCESS;
+}
+
+/* Search logical prefixes inside a wide page without reconstructing keys.
+ * Forward page traversal retains ancestors instead of restarting at the root. */
+static int
+mdb_dup_project_lower_bound(MDB_cursor *mc, MDB_page *page,
+	const MDB_val *trunk, MDB_dup_projector *p, size_t wanted,
+	unsigned int low, unsigned int *index)
+{
+	unsigned int high = NUMKEYS(page);
+	int fixed = IS_LEAF2(page);
+	while (low < high) {
+		unsigned int mid = low + (high - low) / 2;
+		MDB_key_parts parts;
+		int cmp, rc;
+		if (fixed) {
+			parts.prefix = NULL;
+			parts.prefix_len = 0;
+			parts.suffix = (const unsigned char *)LEAF2KEY(page, mid, mc->mc_db->md_pad);
+			parts.suffix_len = mc->mc_db->md_pad;
+		} else {
+			MDB_node *node = NODEPTR(page, mid);
+			rc = mdb_leaf_key_parts(mid ? trunk : NULL, NODEKEY(page, node),
+			    node->mn_ksize, ENV_MAXKEY(mc->mc_txn->mt_env), NULL, &parts);
+			if (rc != MDB_SUCCESS) return rc;
+		}
+		if (p->prefix32 && parts.prefix_len + parts.suffix_len >= 4) {
+			uint32_t value = mdb_dup_prefix32(&parts), key = p->prefix32[wanted];
+			cmp = (value > key) - (value < key);
+		} else cmp = mdb_dup_prefix_compare(&parts, &p->prefixes[wanted]);
+		if (cmp < 0) low = mid + 1;
+		else high = mid;
+	}
+	*index = low;
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_dup_project_wide_page(MDB_cursor *mc, MDB_page *page,
+	MDB_dup_projector *p, size_t *wanted, MDB_val *values,
+	unsigned char *present)
+{
+	unsigned int n = NUMKEYS(page);
+	int fixed = IS_LEAF2(page);
+	int compressed = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+	MDB_val trunk = {0, NULL};
+	if (!fixed && compressed && n) {
+		MDB_node *node = NODEPTR(page, 0);
+		trunk.mv_size = node->mn_ksize;
+		trunk.mv_data = NODEKEY(page, node);
+	}
+	for (unsigned int i = 0; i < n && *wanted < p->count; i++) {
+		MDB_key_parts parts;
+		int rc;
+		rc = mdb_dup_project_lower_bound(mc, page, &trunk, p, *wanted, i, &i);
+		if (rc != MDB_SUCCESS) return rc;
+		if (i == n) break;
+		if (fixed) {
+			parts.prefix = NULL;
+			parts.prefix_len = 0;
+			parts.suffix = (const unsigned char *)LEAF2KEY(page, i, mc->mc_db->md_pad);
+			parts.suffix_len = mc->mc_db->md_pad;
+		} else {
+			MDB_node *node = NODEPTR(page, i);
+			rc = mdb_leaf_key_parts(i ? &trunk : NULL,
+			    NODEKEY(page, node), node->mn_ksize, ENV_MAXKEY(mc->mc_txn->mt_env), NULL, &parts);
+			if (rc != MDB_SUCCESS)
+				return rc;
+		}
+		rc = mdb_dup_project_match(p, &parts, wanted, values, present);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+	return MDB_SUCCESS;
+}
+
+static int
+mdb_dup_project_page(MDB_cursor *mc, MDB_page *page,
+	MDB_dup_projector *p, size_t *wanted, MDB_val *values,
+	unsigned char *present)
+{
+	unsigned int n = NUMKEYS(page);
+	if (n > 64)
+		return mdb_dup_project_wide_page(mc, page, p, wanted, values, present);
+	int fixed = IS_LEAF2(page);
+	int compressed = (mc->mc_db->md_flags & MDB_PREFIX_COMPRESSION) != 0;
+	MDB_val trunk = {0, NULL};
+	if (!fixed && compressed && n) {
+		MDB_node *node = NODEPTR(page, 0);
+		trunk.mv_size = node->mn_ksize;
+		trunk.mv_data = NODEKEY(page, node);
+	}
+	for (unsigned int i = 0; i < n && *wanted < p->count; i++) {
+		MDB_key_parts parts;
+		int rc;
+		if (fixed) {
+			parts.prefix = NULL;
+			parts.prefix_len = 0;
+			parts.suffix = (const unsigned char *)LEAF2KEY(page, i, mc->mc_db->md_pad);
+			parts.suffix_len = mc->mc_db->md_pad;
+		} else {
+			MDB_node *node = NODEPTR(page, i);
+			rc = mdb_leaf_key_parts(i ? &trunk : NULL,
+			    NODEKEY(page, node), node->mn_ksize, ENV_MAXKEY(mc->mc_txn->mt_env), NULL, &parts);
+			if (rc != MDB_SUCCESS)
+				return rc;
+		}
+		rc = mdb_dup_project_match(p, &parts, wanted, values, present);
+		if (rc != MDB_SUCCESS)
+			return rc;
+	}
+	return MDB_SUCCESS;
+}
+
+int
+mdb_cursor_project_dup(MDB_cursor *mc, MDB_dup_projector *p,
+	MDB_val *values, unsigned char *present)
+{
+	MDB_page *page;
+	MDB_node *node;
+	size_t wanted = 0;
+	int rc;
+	if (!mc || !p || !values || !present)
+		return EINVAL;
+	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
+		return MDB_BAD_TXN;
+	if (!(mc->mc_txn->mt_flags & MDB_TXN_RDONLY) || !mc->mc_xcursor ||
+	    !(mc->mc_db->md_flags & MDB_DUPSORT) || mc->mc_dbx->md_dcmp != mdb_cmp_memn)
+		return MDB_INCOMPATIBLE;
+	if (!(mc->mc_flags & C_INITIALIZED) || !mc->mc_snum)
+		return MDB_NOTFOUND;
+	page = mc->mc_pg[mc->mc_top];
+	if (mc->mc_ki[mc->mc_top] >= NUMKEYS(page))
+		return MDB_NOTFOUND;
+	rc = mdb_txn_check_interrupt(mc->mc_txn);
+	if (rc != MDB_SUCCESS)
+		return rc;
+	p->arena_used = 0;
+	for (size_t i = 0; i < p->count; i++) {
+		values[i].mv_size = 0;
+		values[i].mv_data = NULL;
+		present[i] = 0;
+		p->offsets[i] = SIZE_MAX;
+	}
+	node = NODEPTR(page, mc->mc_ki[mc->mc_top]);
+	if (!(node->mn_flags & F_DUPDATA)) {
+		MDB_val value;
+		rc = mdb_node_read(mc, node, &value);
+		if (rc == MDB_SUCCESS) {
+			MDB_key_parts parts = {NULL, 0, value.mv_data, value.mv_size};
+			rc = mdb_dup_project_match(p, &parts, &wanted, values, present);
+		}
+	} else if (!(node->mn_flags & F_SUBDATA)) {
+		/* Inline duplicate pages need no cursor movement or whole-leaf cache. */
+		rc = mdb_dup_project_page(&mc->mc_xcursor->mx_cursor,
+		    NODEDATA(node), p, &wanted, values, present);
+	} else {
+		/* An independent stack cursor preserves the caller's duplicate position
+		 * and keeps selected bytes separate from per-page decode scratch. */
+		MDB_db db;
+		MDB_dbx dbx = {0};
+		unsigned char dbflag = DB_VALID | DB_USRVALID | DB_DUPDATA;
+		MDB_cursor sub = {0};
+		memcpy(&db, NODEDATA(node), sizeof(db));
+		db.md_flags |= mc->mc_db->md_flags & (MDB_PREFIX_COMPRESSION | MDB_COUNTED);
+		dbx.md_cmp = mc->mc_dbx->md_dcmp;
+		sub.mc_txn = mc->mc_txn;
+		sub.mc_db = &db;
+		sub.mc_dbx = &dbx;
+		sub.mc_dbflag = &dbflag;
+		sub.mc_dbi = mc->mc_dbi;
+		sub.mc_flags = C_SUB | (mc->mc_txn->mt_flags & (C_ORIG_RDONLY | C_WRITEMAP));
+		sub.mc_key.mv_data = sub.mc_keybuf;
+		sub.mc_key_pgno = P_INVALID;
+		sub.mc_key_last = (indx_t)~0;
+		mdb_cursor_seq_invalidate(&sub);
+		rc = mdb_page_search(&sub, NULL, MDB_PS_FIRST);
+		while (rc == MDB_SUCCESS) {
+			page = sub.mc_pg[sub.mc_top];
+			rc = mdb_dup_project_page(&sub, page, p, &wanted, values, present);
+			if (rc != MDB_SUCCESS || wanted == p->count)
+				break;
+			rc = mdb_txn_check_interrupt(mc->mc_txn);
+			if (rc != MDB_SUCCESS)
+				break;
+			rc = mdb_cursor_sibling(&sub, 1);
+		}
+		if (rc == MDB_NOTFOUND)
+			rc = MDB_SUCCESS;
+		MDB_CURSOR_UNREF(&sub, 1);
+	}
+	if (rc == MDB_SUCCESS) {
+		/* Resolve offsets only after the arena has stopped growing. */
+		for (size_t i = 0; i < p->count; i++) {
+			if (p->offsets[i] != SIZE_MAX)
+				values[i].mv_data = p->arena + p->offsets[i];
+		}
+	}
+	return rc;
 }
 
 void

@@ -358,6 +358,70 @@ static void allocation_failure_test(int nested) {
 	close_env(env, dir);
 }
 
+/* Fail every projector allocation, including growth after earlier matches.
+ * A failed projection must leave its handle reusable and leak no storage. */
+static void projection_failure_test(void) {
+	MDB_val fixed[] = {{4, "aaaa"}, {4, "bbbb"}};
+	for (unsigned width = 3; width <= 4; width++) {
+		fixed[0].mv_size = fixed[1].mv_size = width;
+		int fault;
+		for (fault = 0; fault < 16; fault++) {
+			MDB_dup_projector *p = NULL;
+			failed_allocation = 0;
+			fail_after = fault;
+			int rc = mdb_dup_projector_create(&p, fixed, 2);
+			fail_after = -1;
+			assert(rc == (failed_allocation ? ENOMEM : 0));
+			if (rc)
+				assert(!p);
+			mdb_dup_projector_destroy(p);
+			check_live(0, 0);
+			if (!failed_allocation)
+				break;
+		}
+		assert(fault > 0 && fault < 16);
+	}
+	char dir[] = "/tmp/dlmdb-projection-oom-XXXXXX";
+	MDB_env *env = open_env(dir);
+	MDB_dbi dbi = populate(env, MDB_PREFIX_COMPRESSION, DUP_COUNT);
+	MDB_txn *txn;
+	MDB_cursor *cur;
+	MDB_val key = {4, "wide"}, prefixes[16], values[16];
+	unsigned char present[16];
+	char expected[16][VALUE_SIZE];
+	for (unsigned i = 0; i < 16; i++) {
+		make_value(expected[i], 1 + 53 * i);
+		prefixes[i] = (MDB_val){11, expected[i]};
+	}
+	assert(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) == 0);
+	assert(mdb_cursor_open(txn, dbi, &cur) == 0);
+	assert(mdb_cursor_get(cur, &key, NULL, MDB_FIRST) == 0);
+	size_t blocks = live_blocks, bytes = live_bytes;
+	int fault;
+	for (fault = 0; fault < 16; fault++) {
+		MDB_dup_projector *p;
+		assert(mdb_dup_projector_create(&p, prefixes, 16) == 0);
+		failed_allocation = 0;
+		fail_after = fault;
+		int rc = mdb_cursor_project_dup(cur, p, values, present);
+		fail_after = -1;
+		assert(rc == (failed_allocation ? ENOMEM : 0));
+		assert(mdb_cursor_project_dup(cur, p, values, present) == 0);
+		for (unsigned i = 0; i < 16; i++) {
+			assert(present[i] && values[i].mv_size == VALUE_SIZE);
+			assert(!memcmp(values[i].mv_data, expected[i], VALUE_SIZE));
+		}
+		mdb_dup_projector_destroy(p);
+		check_live(blocks, bytes);
+		if (!failed_allocation)
+			break;
+	}
+	assert(fault > 1 && fault < 16);
+	mdb_cursor_close(cur);
+	mdb_txn_abort(txn);
+	close_env(env, dir);
+}
+
 static void env_failure_test(unsigned flags) {
 	char dir[] = "/tmp/dlmdb-memory-XXXXXX";
 	assert(mkdtemp(dir));
@@ -537,6 +601,7 @@ int main(int argc, char **argv) {
 	RUN("nested-cached-commit", nested_test(1, 1));
 	RUN("nested-cached-abort", nested_test(0, 1));
 	RUN("list-oom", allocation_failure_test(0));
+	RUN("projection-oom", projection_failure_test());
 	RUN("nested-begin-oom", allocation_failure_test(1));
 	RUN("env-open-oom", env_failure_test(0));
 	RUN("reader-begin-failure", reader_failure_test());

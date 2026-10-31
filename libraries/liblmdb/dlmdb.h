@@ -1775,6 +1775,40 @@ int  mdb_cursor_count(MDB_cursor *cursor, mdb_size_t *countp);
 int  mdb_cursor_list_dup(MDB_cursor *cursor,
 		const MDB_val **values, mdb_size_t *countp);
 
+
+	/** Opaque, invocation-local duplicate prefix selection and output storage. */
+typedef struct MDB_dup_projector MDB_dup_projector;
+
+	/** @brief Create a reusable duplicate prefix projector.
+	 * Prefixes must be nonempty, bytewise-sorted and non-overlapping. Inputs
+	 * are copied. One projector belongs to one active scan and is not shared
+	 * concurrently. Returns EINVAL for invalid inputs or ENOMEM on allocation
+	 * failure. On success the caller owns the handle and must destroy it.
+	 */
+int mdb_dup_projector_create(MDB_dup_projector **out,
+		const MDB_val *prefixes, size_t count);
+
+	/** @brief Select the first duplicate matching each prefix at the current key.
+	 * Only read-only transactions, MDB_DUPSORT and the default bytewise duplicate
+	 * comparator are supported. Prefix-compressed and fixed-width duplicate
+	 * pages, single-value keys, and multi-page duplicate trees are supported.
+	 * Neither the main nor duplicate cursor position is changed. Output arrays
+	 * each contain the projector's count entries, in input prefix order. A
+	 * missing prefix has present[i] == 0 and a zeroed MDB_val. No matches is a
+	 * successful result; MDB_NOTFOUND means no current cursor key. All outputs
+	 * must be ignored on error.
+	 * Selected reconstructed bytes use projector-owned storage; raw values can
+	 * alias mapped pages. Outputs expire on the next projector call, any cursor
+	 * operation, projector destruction, or transaction end. Workspace is reused
+	 * and grows with selected bytes, without a per-duplicate decoded page array.
+	 * Unsupported transactions/comparators return MDB_INCOMPATIBLE.
+	 */
+int mdb_cursor_project_dup(MDB_cursor *cursor, MDB_dup_projector *projector,
+		MDB_val *values, unsigned char *present);
+
+	/** @brief Release a projector and all of its owned storage. NULL is safe. */
+void mdb_dup_projector_destroy(MDB_dup_projector *projector);
+
 	/** @brief Compare two data items according to a particular database.
 	 *
 	 * This returns a comparison as if the two data items were keys in the

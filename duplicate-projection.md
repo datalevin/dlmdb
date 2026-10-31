@@ -120,3 +120,55 @@ projection with identical checksums. Arguments are:
 Each invocation uses a 1024 MiB in-memory map, runs two warmup rounds, then seven
 measured rounds, alternating the order of the full and selective paths. Standard
 `count_bench` and `compress_bench` remain useful controls for the shared decoder.
+
+## Performance tradeoff
+
+Selective projection is an opt-in path for sparse selections from large
+duplicate groups. It is not a general replacement for `mdb_cursor_list_dup`.
+Selecting most or all duplicates can cost more than full materialization, and
+even sparse selections from small groups do not consistently benefit. Benchmark
+the expected group sizes, value widths, and selection densities before choosing
+the path; the API does not automatically switch to full materialization.
+
+Measurements on 2026-10-30 used an Apple M3 Pro (arm64, 12 logical CPUs, 36 GiB
+RAM), Apple clang 21.0.0, and `-pthread -O2 -g` without sanitizers. Both paths
+used the working-tree implementation, `MDB_DUPSORT | MDB_COUNTED |
+MDB_PREFIX_COMPRESSION`, and a 1024 MiB in-memory map. Times below are per key,
+including cursor traversal and result consumption, and are medians of 14 warmed
+scans across two independently populated runs. Each run discarded two warmup
+rounds and alternated full/selective execution order. All checksums matched.
+
+| Keys | Selected / duplicates per key | Value bytes | Full (µs/key) | Selective (µs/key) | Selective result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 50,000 | 7 / 20 | 96 | 0.281 | 0.257 | 1.09× faster |
+| 50,000 | 1 / 20 | 96 | 0.280 | 0.298 | 7% slower |
+| 500 | 7 / 2,000 | 96 | 27.61 | 6.21 | 4.45× faster |
+| 500 | 7 / 2,000 | 8 | 27.23 | 2.09 | 13.06× faster |
+| 50,000 | 20 / 20 | 96 | 0.277 | 0.330 | 19% slower |
+| 500 | 2,000 / 2,000 | 96 | 28.86 | 117.27 | 4.06× slower |
+| 10,000 | 7 / 20 | 256 | 0.557 | 0.679 | 22% slower |
+
+Each row can be reproduced with `./dup_projection_bench KEYS DUPLICATES BYTES
+SELECTED 1`. Without prefix compression (final argument `0`), selecting 7 of
+2,000 96-byte duplicates was 4.33× faster; selecting 7 of 20 was only 1.05× faster.
+These synthetic workloads use four-byte selectors that all match existing
+values. They exclude database population and persistence costs and do not
+establish a universal selection-density threshold.
+
+Separate comparisons against pre-change commit `9ecf8bc` used clean, isolated
+builds. Existing compressed warm-read and range-scan controls stayed within
+about 1% of the baseline, although some full-materialization cases above showed
+3–6% slowdowns relative to that commit. Thus, the shared decoder refactor should
+not be assumed to be performance-neutral for every workload. Control timings
+used medians of three runs, alternating baseline/current order:
+
+```sh
+./compress_bench -n 50000 -r 200000 -v 96 -p 64 -m 512 -D 20 -R 2000 -L 128 -s 1
+./count_bench --entries 50000 --queries 5000 --span 200 --dups 8
+```
+
+The compression control used a 512 MiB map; the count control used
+`entries * 128` bytes for unique keys and `entries * duplicates * 128` bytes for
+duplicate groups. Key-count and duplicate-count medians were within 1% of the
+baseline. Prefer full materialization for dense selections until a measured
+alternative improves that case.
